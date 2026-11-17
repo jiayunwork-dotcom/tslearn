@@ -175,6 +175,44 @@ discard complex paths, as described in [2]_:
     cost = dtw_limited_warping_length(x, y, max_length)
 
 
+.. _dtw-channel-weights:
+
+Channel-weighted DTW
+--------------------
+
+For multivariate time series, the local cost of aligning :math:`x_i` with
+:math:`y_j` can be weighted across channels by passing a ``channel_weights``
+vector :math:`w` to :func:`tslearn.metrics.dtw`,
+:func:`tslearn.metrics.dtw_path` and :func:`tslearn.metrics.cdist_dtw`:
+
+.. math::
+
+    DTW_w(x, y) = \min_\pi \sqrt{ \sum_{(i, j) \in \pi}
+    \sum_{c=0}^{d-1} w_c (x_{i,c} - y_{j,c})^2 }
+
+All channels share the same alignment path :math:`\pi` (channels are *not*
+aligned independently and their distances are *not* summed afterwards), and
+channels with a zero weight do not participate in the path cost.
+The weights must be finite, non-negative, not all zero, and are used as
+provided (they are not normalized): multiplying all weights by a positive
+constant scales the distance by the square root of that constant.
+Channel weights are currently only supported with the NumPy backend.
+
+.. code-block:: python
+
+    from tslearn.metrics import dtw, dtw_path, cdist_dtw
+
+    dtw_score = dtw(x, y, channel_weights=[1., 0.5])
+    optimal_path, dtw_score = dtw_path(x, y, channel_weights=[1., 0.5])
+    cross_dists = cdist_dtw(dataset1, dataset2, channel_weights=[1., 0.5])
+
+Per-cluster channel weights can also be *learned* jointly with cluster
+centers by :class:`tslearn.clustering.TimeSeriesKMeans` (see
+:ref:`kmeans-channel-weights`), and jointly with a barycenter by
+:func:`tslearn.barycenters.dtw_barycenter_averaging` (see
+:ref:`dtw-barycenters`).
+
+
 .. _dtw-barycenters:
 
 Barycenters
@@ -195,6 +233,32 @@ algorithm presented in [3]_.
 
     from tslearn.barycenters import dtw_barycenter_averaging
     b = dtw_barycenter_averaging(dataset)
+
+When ``channel_weight_regularization`` is set to a positive value
+:math:`\lambda`, DBA additionally learns a channel weight vector :math:`w`
+jointly with the barycenter:
+
+.. math::
+
+    \min_{\mu, w} \frac{1}{\sum_k s_k} \sum_k s_k \, DTW_w(\mu, x_k)^2
+    + \lambda \sum_c w_c \log w_c
+    \quad \text{s.t.} \quad \sum_c w_c = d,\ w_c \geq \varepsilon
+
+where :math:`s_k` are the (optional) sample weights and
+:math:`\varepsilon` is ``min_channel_weight``. The entropy term
+:math:`\lambda \sum_c w_c \log w_c` keeps the weights from collapsing onto a
+single channel: the larger :math:`\lambda`, the closer the weights stay to
+the uniform vector. In that case the function returns a tuple
+``(barycenter, channel_weights, objective_history)`` where
+``objective_history`` is the (non-increasing) list of true objective values
+of the accepted optimization states:
+
+.. code-block:: python
+
+    from tslearn.barycenters import dtw_barycenter_averaging
+    b, w, history = dtw_barycenter_averaging(
+        dataset, channel_weight_regularization=0.1
+    )
 
 
 This is the algorithm at stake when invoking

@@ -10,6 +10,24 @@ Changelogs for this project are recorded in this file since v0.2.0.
 
 
 
+## [Unreleased]
+
+### Added
+
+* Option `channel_weights` in `dtw`, `dtw_path` and `cdist_dtw` to compute
+DTW with per-channel weights (all channels still share a single alignment
+path). NumPy backend only.
+* Options `channel_weight_regularization` and `min_channel_weight` in
+`TimeSeriesKMeans` (with `metric="dtw"`): learn one channel weight vector
+per cluster jointly with the cluster centers by minimizing the average
+weighted squared DTW distance plus an entropy regularizer. Learned weights
+are exposed through `channel_weights_`, and the regularized objective
+through `objective_` and `objective_history_`.
+* Options `channel_weight_regularization`, `min_channel_weight` and
+`init_channel_weights` in `dtw_barycenter_averaging`: learn channel weights
+jointly with the barycenter. When enabled, the function returns a tuple
+`(barycenter, channel_weights, objective_history)`.
+
 ## [v0.6.4]
 
 ### Changed

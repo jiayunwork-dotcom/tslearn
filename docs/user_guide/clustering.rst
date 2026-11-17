@@ -67,6 +67,58 @@ The ``metric`` parameter can also be set to ``"softdtw"`` as an alternative
 time series metric (`cf.`
 :ref:`our User Guide section on soft-DTW <dtw-softdtw>`).
 
+.. _kmeans-channel-weights:
+
+Learning per-cluster channel weights
+------------------------------------
+
+For multivariate time series, different clusters may be best separated by
+different channels (sensors): one cluster may be characterized by the shape
+of the first channel while another is mostly visible in the second channel.
+Setting ``channel_weight_regularization`` to a positive value
+:math:`\lambda` (only with ``metric="dtw"``) makes
+:class:`tslearn.clustering.TimeSeriesKMeans` learn one channel weight vector
+per cluster, jointly with the cluster centers, instead of relying on a
+single global rescaling of the channels:
+
+.. math::
+
+    \min_{\{\mu_k, w_k\}_k} \frac{1}{n} \sum_i DTW_{w_{k(i)}}(x_i, \mu_{k(i)})^2
+    + \lambda \sum_{k, c} w_{k, c} \log w_{k, c}
+    \quad \text{s.t.} \quad \forall k, \sum_c w_{k, c} = d,\ w_{k, c} \geq \varepsilon
+
+where :math:`k(i)` is the cluster assigned to :math:`x_i`,
+:math:`DTW_{w}` is the :ref:`channel-weighted DTW <dtw-channel-weights>` and
+:math:`\varepsilon` is ``min_channel_weight``. The entropy term keeps the
+weights from collapsing onto a single channel: the larger :math:`\lambda`,
+the closer the weights stay to uniform.
+
+.. code-block:: python
+
+    from tslearn.clustering import TimeSeriesKMeans
+
+    model = TimeSeriesKMeans(n_clusters=3, metric="dtw",
+                             channel_weight_regularization=0.1,
+                             random_state=seed)
+    model.fit(X_train)
+    model.channel_weights_  # shape (n_clusters, d): one weight vector per cluster
+    model.objective_        # final value of the regularized objective J
+    model.objective_history_  # non-increasing list of accepted J values
+
+Optimization alternates between (i) assigning each series to its closest
+center using the current per-cluster weights, (ii) recomputing the optimal
+alignment paths, (iii) updating each center with the classic DBA
+Majorize-Minimize update, and (iv) updating each cluster's weights by
+exactly minimizing the fixed-path surrogate plus the entropy regularizer.
+Each of these steps does not increase the true objective :math:`J`, so
+``objective_history_`` is non-increasing (up to a numerical tolerance) and
+its last entry corresponds to the delivered model. After fitting,
+``transform`` and ``predict`` use each cluster's own learned weights when
+computing distances. The same weight-learning scheme is available for a
+single cluster through
+:func:`tslearn.barycenters.dtw_barycenter_averaging` (see
+:ref:`dtw-barycenters`).
+
 .. _kernel-kmeans:
 
 

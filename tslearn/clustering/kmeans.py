@@ -4,6 +4,7 @@ import numpy
 import sklearn
 from scipy.spatial.distance import cdist
 from sklearn.base import ClusterMixin, TransformerMixin
+from sklearn.exceptions import ConvergenceWarning, NotFittedError
 from sklearn.metrics.pairwise import pairwise_kernels
 from sklearn.utils import check_random_state
 from sklearn.utils.extmath import stable_cumsum
@@ -40,9 +41,25 @@ from tslearn.barycenters import (
     euclidean_barycenter,
     softdtw_barycenter,
 )
+from tslearn.barycenters.dba import (
+    _check_channel_weight_regularization,
+    _check_min_channel_weight,
+    _entropy,
+    _mm_update_barycenter,
+    _mm_valence_warping,
+    _per_channel_costs,
+    _solve_channel_weights_entropy,
+)
 from tslearn.bases import BaseModelPackage, TimeSeriesBaseEstimator
 from tslearn.metrics import cdist_dtw, cdist_gak, cdist_soft_dtw, sigma_gak
-from tslearn.utils import check_array, check_dims, to_sklearn_dataset, to_time_series_dataset
+from tslearn.metrics.dtw_variants import dtw_path
+from tslearn.utils import (
+    check_array,
+    check_dims,
+    to_sklearn_dataset,
+    to_time_series_dataset,
+    ts_size,
+)
 
 from .utils import (
     EmptyClusterError,
@@ -522,6 +539,27 @@ class TimeSeriesKMeans(
     dtw_inertia: bool (default: False)
         Whether to compute DTW inertia even if DTW is not the chosen metric.
 
+    channel_weight_regularization : None or float (default: None)
+        If None, the model is unchanged. If a finite positive real number
+        :math:`\\lambda` (only allowed with `metric="dtw"`), a per-cluster
+        channel weight vector is learned together with the cluster centers
+        by minimizing
+
+        .. math::
+
+            J = \\frac{1}{n} \\sum_i DTW_{w_{k(i)}}(x_i, \\mu_{k(i)})^2
+            + \\lambda \\sum_{k, c} w_{k, c} \\log w_{k, c}
+
+        where :math:`k(i)` is the cluster assigned to :math:`x_i` and each
+        :math:`w_k` is constrained to sum to `d` with entries at least
+        `min_channel_weight`. Distances used for assignment, `transform` and
+        `predict` are then computed with each cluster's own learned weights
+        (not with a single global scaling).
+
+    min_channel_weight : float (default: 1e-6)
+        Lower bound :math:`\\varepsilon \\in (0, 1)` on each learned channel
+        weight. Only used when `channel_weight_regularization` is set.
+
     verbose : int (default: 0)
         If nonzero, print information about the inertia while learning
         the model and joblib progress messages are printed.
@@ -553,7 +591,27 @@ class TimeSeriesKMeans(
         centroid if those are provided as a numpy array through init parameter.
 
     inertia_ : float
-        Sum of distances of samples to their closest cluster center.
+        Sum of distances of samples to their closest cluster center divided
+        by the number of samples (average squared distance). When
+        `channel_weight_regularization` is set, distances are the learned
+        weighted DTW distances.
+
+    objective_ : float or None
+        Value of the regularized objective :math:`J` (see
+        `channel_weight_regularization`) for the delivered model. None when
+        `channel_weight_regularization` is None.
+
+    objective_history_ : numpy.ndarray of shape (n_iterations + 1,) or None
+        True objective values of the accepted states for the selected
+        initialization, in chronological order (non-increasing up to a
+        numerical tolerance of 1e-8 * max(1, |J_previous|)). The last entry
+        corresponds to the delivered model. None when
+        `channel_weight_regularization` is None.
+
+    channel_weights_ : numpy.ndarray of shape (n_clusters, d) or None
+        Learned per-cluster channel weights (each row sums to `d` with
+        entries at least `min_channel_weight`). None when
+        `channel_weight_regularization` is None.
 
     n_iter_ : int
         The number of iterations performed during fit.
@@ -605,6 +663,8 @@ class TimeSeriesKMeans(
         verbose=0,
         random_state=None,
         init="k-means++",
+        channel_weight_regularization=None,
+        min_channel_weight=1e-6,
     ):
         self.n_clusters = n_clusters
         self.max_iter = max_iter
@@ -618,10 +678,12 @@ class TimeSeriesKMeans(
         self.verbose = verbose
         self.random_state = random_state
         self.init = init
+        self.channel_weight_regularization = channel_weight_regularization
+        self.min_channel_weight = min_channel_weight
 
     def _is_fitted(self):
         check_is_fitted(self, ["cluster_centers_"])
-        return True
+        return self.cluster_centers_ is not None
 
     def _get_metric_params(self):
         if self.metric_params is None:
@@ -631,6 +693,202 @@ class TimeSeriesKMeans(
         if "n_jobs" in metric_params.keys():
             del metric_params["n_jobs"]
         return metric_params
+
+    @property
+    def _adaptive_channel_weights(self):
+        """Whether per-cluster channel weights are learned."""
+        return self.channel_weight_regularization is not None
+
+    def _check_adaptive_params(self):
+        """Validate channel-weight-learning hyper-parameters.
+
+        Raises
+        ------
+        ValueError
+            If any of the new parameters is invalid. This is called before
+            any optimization starts.
+        """
+        regularization = _check_channel_weight_regularization(
+            self.channel_weight_regularization
+        )
+        min_channel_weight = _check_min_channel_weight(self.min_channel_weight)
+        if self.metric != "dtw":
+            raise ValueError(
+                "channel_weight_regularization is only supported with "
+                "metric='dtw', got metric=%r." % self.metric
+            )
+        if (
+            self.metric_params is not None
+            and "channel_weights" in self.metric_params
+        ):
+            raise ValueError(
+                "metric_params must not contain 'channel_weights' when "
+                "channel_weight_regularization is set: per-cluster channel "
+                "weights are then learned, not fixed."
+            )
+        return regularization, min_channel_weight
+
+    @staticmethod
+    def _check_adaptive_dataset(X_):
+        """Strictly validate a dataset for adaptive channel-weight learning.
+
+        Only finite real values are allowed, plus trailing all-NaN rows used
+        to pad variable-length time series. Internal NaNs, partial-channel
+        NaNs, infinite values and empty series are rejected.
+        """
+        for i in range(X_.shape[0]):
+            sz_i = ts_size(X_[i])
+            if sz_i == 0:
+                raise ValueError(
+                    "Time series at index %d is empty (only NaNs or zero "
+                    "length), which is not allowed when "
+                    "channel_weight_regularization is set." % i
+                )
+            if not numpy.all(numpy.isfinite(X_[i, :sz_i])):
+                raise ValueError(
+                    "Time series at index %d contains NaN or infinite "
+                    "values outside of trailing all-NaN padding rows, which "
+                    "is not allowed when channel_weight_regularization is "
+                    "set." % i
+                )
+
+    def _transform_weighted_with_centers(self, X, centers, channel_weights):
+        """Distance to given centers using per-cluster channel weights.
+
+        Column `k` of the returned matrix holds the DTW distances between
+        the samples and `centers[k]`, computed with `channel_weights[k]`.
+        """
+        metric_params = self._get_metric_params()
+        dists = numpy.empty((X.shape[0], self.n_clusters))
+        for k in range(self.n_clusters):
+            dists[:, k] = cdist_dtw(
+                X,
+                centers[k: k + 1],
+                channel_weights=channel_weights[k],
+                n_jobs=self.n_jobs,
+                verbose=self.verbose,
+                **metric_params
+            )[:, 0]
+        return dists
+
+    def _transform_weighted(self, X, channel_weights):
+        """Distance to each cluster center using per-cluster channel weights.
+
+        Column `k` of the returned matrix holds the DTW distances between
+        the samples and the `k`-th center, computed with `channel_weights[k]`.
+        """
+        return self._transform_weighted_with_centers(
+            X, self.cluster_centers_, channel_weights
+        )
+
+    def _objective_from_dists(self, dists, labels, channel_weights):
+        """True regularized objective J from a distance matrix and labels."""
+        regularization, _ = self._check_adaptive_params()
+        return _compute_inertia(dists, labels, True) + regularization * (
+            _entropy(channel_weights.ravel())
+        )
+
+    def _fit_one_init_adaptive(self, X, metric_params):
+        """Single-initialization fit with learned per-cluster channel weights.
+
+        Alternating scheme (one update of each block per iteration):
+        (i) samples are (re-)assigned to their closest center using the
+        current per-cluster weights, (ii) optimal warping paths to the
+        assigned centers are computed, (iii) each center is updated with the
+        classic MM (DBA) update, (iv) each cluster's weights are updated by
+        exactly minimizing the fixed-path surrogate plus the entropy
+        regularizer. Steps (i)-(iv) never increase the true objective J, so
+        the recorded objective history is non-increasing (up to a numerical
+        acceptance tolerance of 1e-8 * max(1, |J_previous|)).
+        """
+        regularization, min_channel_weight = self._check_adaptive_params()
+        n_ts = X.shape[0]
+        d = X.shape[2]
+        barycenter_size = self.cluster_centers_.shape[1]
+        channel_weights = numpy.ones((self.n_clusters, d))
+
+        dists = self._transform_weighted(X, channel_weights)
+        labels = dists.argmin(axis=1)
+        _check_no_empty_cluster(labels, self.n_clusters)
+        objective = self._objective_from_dists(dists, labels, channel_weights)
+        objective_history = [objective]
+
+        for it in range(self.max_iter):
+            # (ii) optimal paths for the current centers and weights
+            list_paths = []
+            for k in range(self.n_clusters):
+                Xk = X[labels == k]
+                paths_k = []
+                for i in range(Xk.shape[0]):
+                    path, _ = dtw_path(
+                        self.cluster_centers_[k],
+                        Xk[i],
+                        channel_weights=channel_weights[k],
+                        **metric_params
+                    )
+                    paths_k.append(path)
+                list_paths.append(paths_k)
+            # (iii) + (iv) center and weight updates, cluster by cluster
+            new_centers = numpy.empty_like(self.cluster_centers_)
+            new_channel_weights = numpy.empty_like(channel_weights)
+            for k in range(self.n_clusters):
+                Xk = X[labels == k]
+                n_k = Xk.shape[0]
+                sw = numpy.ones((n_k,))
+                diag_sum_v_k, list_w_k = _mm_valence_warping(
+                    list_paths[k], barycenter_size, sw
+                )
+                new_centers[k] = _mm_update_barycenter(
+                    Xk, diag_sum_v_k, list_w_k
+                )
+                # Scale per-channel costs by n_k / n_ts so that the
+                # cluster-level surrogate matches the global objective J
+                # (whose data term averages over all n_ts samples).
+                per_channel = _per_channel_costs(
+                    Xk, new_centers[k], list_paths[k], sw
+                ) * (n_k / float(n_ts))
+                new_channel_weights[k] = _solve_channel_weights_entropy(
+                    per_channel, regularization, min_channel_weight
+                )
+            # (i) re-assign with the updated centers and weights
+            new_dists = self._transform_weighted_with_centers(
+                X, new_centers, new_channel_weights
+            )
+            new_labels = new_dists.argmin(axis=1)
+            _check_no_empty_cluster(new_labels, self.n_clusters)
+            new_objective = self._objective_from_dists(
+                new_dists, new_labels, new_channel_weights
+            )
+            accept_tol = 1e-8 * max(1.0, abs(objective))
+            if new_objective > objective + accept_tol:
+                # Should not happen (each step decreases the true objective
+                # in exact arithmetic): refuse the increasing state.
+                warnings.warn(
+                    "TimeSeriesKMeans adaptive objective increased by more "
+                    "than the acceptance tolerance (numerical issue). "
+                    "Stopping optimization.",
+                    ConvergenceWarning,
+                )
+                break
+            self.cluster_centers_ = new_centers
+            channel_weights = new_channel_weights
+            dists = new_dists
+            labels = new_labels
+            objective_history.append(new_objective)
+            if self.verbose:
+                print("%.3f" % new_objective, end=" --> ")
+            if abs(objective - new_objective) < self.tol:
+                objective = new_objective
+                break
+            objective = new_objective
+
+        self.labels_ = labels
+        self.channel_weights_ = channel_weights
+        self.inertia_ = _compute_inertia(dists, labels, True)
+        self.objective_history_ = numpy.array(objective_history)
+        self.objective_ = objective_history[-1]
+        self._iter = it + 1
+        return self
 
     def _fit_one_init(self, X, x_squared_norms, rs):
         metric_params = self._get_metric_params()
@@ -686,6 +944,8 @@ class TimeSeriesKMeans(
         else:
             raise ValueError("Value %r for parameter 'init'" "is invalid" % self.init)
         self.cluster_centers_ = _check_full_length(self.cluster_centers_)
+        if self._adaptive_channel_weights:
+            return self._fit_one_init_adaptive(X, metric_params)
         old_inertia = numpy.inf
 
         for it in range(self.max_iter):
@@ -713,6 +973,10 @@ class TimeSeriesKMeans(
                 metric="euclidean",
             )
         elif self.metric == "dtw":
+            if self._adaptive_channel_weights:
+                # Each cluster center is associated with its own learned
+                # channel weights.
+                return self._transform_weighted(X, self.channel_weights_)
             return cdist_dtw(
                 X,
                 self.cluster_centers_,
@@ -777,6 +1041,9 @@ class TimeSeriesKMeans(
         y
             Ignored
         """
+        if self._adaptive_channel_weights:
+            # Validate the new parameters before any optimization starts.
+            self._check_adaptive_params()
 
         X = check_array(X, allow_nd=True, force_all_finite="allow-nan")
 
@@ -793,12 +1060,21 @@ class TimeSeriesKMeans(
         self.cluster_centers_ = None
         self._X_fit = None
         self._squared_inertia = True
+        if self._adaptive_channel_weights:
+            # These attributes only exist in adaptive mode so that the
+            # default model keeps its exact v0.6.4 attribute set (including
+            # for serialization).
+            self.channel_weights_ = None
+            self.objective_ = None
+            self.objective_history_ = None
 
         self.n_iter_ = 0
 
         max_attempts = max(self.n_init, 10)
 
         X_ = to_time_series_dataset(X)
+        if self._adaptive_channel_weights:
+            self._check_adaptive_dataset(X_)
         rs = check_random_state(self.random_state)
 
         if (
@@ -815,7 +1091,10 @@ class TimeSeriesKMeans(
         _check_initial_guess(self.init, self.n_clusters)
 
         best_correct_centroids = None
+        best_correct_channel_weights = None
+        best_objective_history = None
         min_inertia = numpy.inf
+        min_objective = numpy.inf
         n_successful = 0
         n_attempts = 0
         while n_successful < self.n_init and n_attempts < max_attempts:
@@ -824,15 +1103,50 @@ class TimeSeriesKMeans(
                     print("Init %d" % (n_successful + 1))
                 n_attempts += 1
                 self._fit_one_init(X_, x_squared_norms, rs)
-                if self.inertia_ < min_inertia:
+                if self._adaptive_channel_weights:
+                    # Select the initialization with the lowest final value
+                    # of the true regularized objective J.
+                    if self.objective_ < min_objective:
+                        best_correct_centroids = self.cluster_centers_.copy()
+                        best_correct_channel_weights = self.channel_weights_.copy()
+                        best_objective_history = self.objective_history_.copy()
+                        min_objective = self.objective_
+                        min_inertia = self.inertia_
+                        self.n_iter_ = self._iter
+                elif self.inertia_ < min_inertia:
                     best_correct_centroids = self.cluster_centers_.copy()
                     min_inertia = self.inertia_
                     self.n_iter_ = self._iter
                 n_successful += 1
             except EmptyClusterError:
+                # A failed attempt (e.g. an empty cluster) is not a
+                # successful descent: it is simply discarded and retried.
                 if self.verbose:
                     print("Resumed because of empty cluster")
+        if self._adaptive_channel_weights:
+            # Set the learned weights before _post_fit so that the final
+            # assignment uses them; the deterministic reassignment performed
+            # there reproduces the labels of the selected initialization.
+            self.channel_weights_ = best_correct_channel_weights
+            self.objective_history_ = best_objective_history
         self._post_fit(X_, best_correct_centroids, min_inertia)
+        if self._adaptive_channel_weights and self._X_fit is None:
+            # Failed fit: do not leave a half-trained-looking set of
+            # centers and weights behind.
+            self.cluster_centers_ = None
+            self.channel_weights_ = None
+            self.labels_ = None
+            self.objective_ = None
+            self.objective_history_ = None
+        if self._adaptive_channel_weights and self._X_fit is not None:
+            # objective_ and the last entry of objective_history_ both
+            # correspond to the delivered model (same centers, weights and
+            # deterministic assignment on the training set): inertia_ is
+            # the data term of J computed on those very distances.
+            regularization, _ = self._check_adaptive_params()
+            self.objective_ = self.inertia_ + regularization * _entropy(
+                self.channel_weights_.ravel()
+            )
         return self
 
     def fit_predict(self, X, y=None):
@@ -873,6 +1187,11 @@ class TimeSeriesKMeans(
         """
         X = check_array(X, allow_nd=True, force_all_finite="allow-nan")
         check_is_fitted(self, "cluster_centers_")
+        if self.cluster_centers_ is None:
+            raise NotFittedError(
+                "This TimeSeriesKMeans instance is not fitted yet or "
+                "the last fit failed."
+            )
         X = check_dims(
             X,
             X_fit_dims=self.cluster_centers_.shape,
@@ -899,6 +1218,11 @@ class TimeSeriesKMeans(
         """
         X = check_array(X, allow_nd=True, force_all_finite="allow-nan")
         check_is_fitted(self, "cluster_centers_")
+        if self.cluster_centers_ is None:
+            raise NotFittedError(
+                "This TimeSeriesKMeans instance is not fitted yet or "
+                "the last fit failed."
+            )
         X = check_dims(
             X,
             X_fit_dims=self.cluster_centers_.shape,

@@ -4,13 +4,88 @@ import numpy
 from numba import njit, prange
 
 from tslearn.backend import instantiate_backend
-from tslearn.utils import to_time_series
+from tslearn.utils import to_time_series, to_time_series_dataset
 
 from .utils import _cdist_generic
 
 __author__ = "Romain Tavenard romain.tavenard[at]univ-rennes2.fr"
 
 GLOBAL_CONSTRAINT_CODE = {None: 0, "": 0, "itakura": 1, "sakoe_chiba": 2}
+
+
+def _check_channel_weights(channel_weights, d, be=None):
+    """Validate a vector of fixed channel weights for weighted DTW.
+
+    Parameters
+    ----------
+    channel_weights : array-like, shape=(d,) or None
+        Candidate channel weight vector. If None, no weighting is applied and
+        None is returned.
+    d : int
+        Expected number of channels (features) of the time series.
+    be : Backend object or string or None
+        Backend. Channel weights are only supported with the NumPy backend.
+
+    Returns
+    -------
+    w : numpy.ndarray of shape (d,), dtype float64 or None
+        A copy of the validated weights (never a view on the caller's data),
+        or None if `channel_weights` was None.
+
+    Raises
+    ------
+    ValueError
+        If the backend is not NumPy, or if the weights are not a
+        one-dimensional real-valued numeric vector of length `d` with finite,
+        non-negative entries and at least one positive entry.
+    """
+    if channel_weights is None:
+        return None
+    be = instantiate_backend(be)
+    if not be.is_numpy:
+        raise ValueError(
+            "channel_weights is only supported with the NumPy backend, "
+            "got backend %r." % be
+        )
+    if isinstance(channel_weights, (bool, numpy.bool_)):
+        raise ValueError(
+            "channel_weights must be an array-like of real numbers, "
+            "not a boolean."
+        )
+    try:
+        w = numpy.asarray(channel_weights)
+    except Exception:
+        raise ValueError(
+            "channel_weights must be an array-like of real numbers, "
+            "got %r." % (channel_weights,)
+        )
+    if w.dtype == numpy.bool_ or not (
+        numpy.issubdtype(w.dtype, numpy.integer)
+        or numpy.issubdtype(w.dtype, numpy.floating)
+    ):
+        raise ValueError(
+            "channel_weights must be a real-valued numeric vector, "
+            "got dtype %r." % w.dtype
+        )
+    if w.ndim != 1:
+        raise ValueError(
+            "channel_weights must be a one-dimensional array, "
+            "got %d dimensions." % w.ndim
+        )
+    if w.shape[0] != d:
+        raise ValueError(
+            "channel_weights must have length %d (one weight per channel), "
+            "got length %d." % (d, w.shape[0])
+        )
+    w = w.astype(numpy.float64)  # this is a copy, caller's array is untouched
+    if not numpy.all(numpy.isfinite(w)):
+        raise ValueError("channel_weights must contain only finite values.")
+    if numpy.any(w < 0.0):
+        raise ValueError("channel_weights must be non-negative.")
+    if not numpy.any(w > 0.0):
+        raise ValueError("channel_weights must have at least one positive "
+                         "entry (an all-zero weight vector is not allowed).")
+    return w
 
 
 @njit()
@@ -33,6 +108,32 @@ def _njit_local_squared_dist(x, y):
     for di in range(x.shape[0]):
         diff = x[di] - y[di]
         dist += diff * diff
+    return dist
+
+
+@njit()
+def _njit_local_squared_dist_weighted(x, y, weights):
+    """Compute the channel-weighted squared distance between two vectors.
+
+    Parameters
+    ----------
+    x : array-like, shape=(d,)
+        A vector.
+    y : array-like, shape=(d,)
+        Another vector.
+    weights : array-like, shape=(d,)
+        Non-negative channel weights.
+
+    Returns
+    -------
+    dist : float
+        Weighted squared distance between x and y, that is
+        ``sum_c weights[c] * (x[c] - y[c]) ** 2``.
+    """
+    dist = 0.0
+    for di in range(x.shape[0]):
+        diff = x[di] - y[di]
+        dist += weights[di] * diff * diff
     return dist
 
 
@@ -101,6 +202,44 @@ def njit_accumulated_matrix(s1, s2, mask):
     return cum_sum[1:, 1:]
 
 
+@njit()
+def njit_accumulated_matrix_weighted(s1, s2, mask, weights):
+    """Compute the accumulated cost matrix score between two time series
+    using channel-weighted local squared distances.
+
+    Parameters
+    ----------
+    s1 : array-like, shape=(sz1, d)
+        First time series.
+    s2 : array-like, shape=(sz2, d)
+        Second time series.
+    mask : array-like, shape=(sz1, sz2)
+        Mask. Unconsidered cells must have infinite values.
+    weights : array-like, shape=(d,)
+        Non-negative channel weights.
+
+    Returns
+    -------
+    mat : array-like, shape=(sz1, sz2)
+        Accumulated cost matrix.
+    """
+    l1 = s1.shape[0]
+    l2 = s2.shape[0]
+    cum_sum = numpy.full((l1 + 1, l2 + 1), numpy.inf)
+    cum_sum[0, 0] = 0.0
+
+    for i in range(l1):
+        for j in range(l2):
+            if numpy.isfinite(mask[i, j]):
+                cum_sum[i + 1, j + 1] = _njit_local_squared_dist_weighted(
+                    s1[i], s2[j], weights
+                )
+                cum_sum[i + 1, j + 1] += min(
+                    cum_sum[i, j + 1], cum_sum[i + 1, j], cum_sum[i, j]
+                )
+    return cum_sum[1:, 1:]
+
+
 def accumulated_matrix(s1, s2, mask, be=None):
     """Compute the accumulated cost matrix score between two time series.
 
@@ -163,6 +302,32 @@ def _njit_dtw(s1, s2, mask):
 
     """
     cum_sum = njit_accumulated_matrix(s1, s2, mask)
+    return numpy.sqrt(cum_sum[-1, -1])
+
+
+@njit(nogil=True)
+def _njit_dtw_weighted(s1, s2, mask, weights):
+    """Compute the channel-weighted dynamic time warping score between two
+    time series.
+
+    Parameters
+    ----------
+    s1 : array-like, shape=(sz1, d)
+        First time series.
+    s2 : array-like, shape=(sz2, d)
+        Second time series.
+    mask : array-like, shape=(sz1, sz2)
+        Mask. Unconsidered cells must have infinite values.
+    weights : array-like, shape=(d,)
+        Non-negative channel weights.
+
+    Returns
+    -------
+    dtw_score : float
+        Channel-weighted Dynamic Time Warping score between both time series.
+
+    """
+    cum_sum = njit_accumulated_matrix_weighted(s1, s2, mask, weights)
     return numpy.sqrt(cum_sum[-1, -1])
 
 
@@ -296,6 +461,7 @@ def dtw_path(
     sakoe_chiba_radius=None,
     itakura_max_slope=None,
     be=None,
+    channel_weights=None,
 ):
     r"""Compute Dynamic Time Warping (DTW) similarity measure between
     (possibly multidimensional) time series and return both the path and the
@@ -307,6 +473,18 @@ def dtw_path(
     .. math::
 
         DTW(X, Y) = \sqrt{\sum_{(i, j) \in \pi} (X_{i} - Y_{j})^2}
+
+    If `channel_weights` is provided, the local cost of aligning :math:`X_i`
+    with :math:`Y_j` becomes :math:`\sum_c w_c (X_{i,c} - Y_{j,c})^2`, so that
+
+    .. math::
+
+        DTW_w(X, Y) = \sqrt{\sum_{(i, j) \in \pi}
+        \sum_c w_c (X_{i,c} - Y_{j,c})^2}
+
+    All channels share the same alignment path :math:`\pi` (channels are not
+    aligned independently), and channels with a zero weight do not contribute
+    to the path cost.
 
     It is not required that both time series share the same size, but they must
     be the same dimension. DTW was originally presented in [1]_ and is
@@ -348,6 +526,13 @@ def dtw_path(
         the PyTorch backend is used.
         If `be` is `None`, the backend is determined by the input arrays.
         See our :ref:`dedicated user-guide page <backend>` for more information.
+    channel_weights : array-like, shape=(d,) or None (default: None)
+        Non-negative channel weights used to compute the local alignment
+        cost. Must be a one-dimensional real-valued vector of length `d`
+        with finite entries and at least one positive entry. Weights are used
+        as provided (they are not normalized). If None, all channels have
+        weight 1, which recovers the standard DTW. Channel weights are only
+        supported with the NumPy backend.
 
     Returns
     -------
@@ -367,6 +552,10 @@ def dtw_path(
     0.0
     >>> float(dtw_path([1, 2, 3], [1., 2., 2., 3., 4.])[1])
     1.0
+    >>> path, dist = dtw_path([[0., 0.], [1., 1.]], [[0., 1.], [1., 0.]],
+    ...                       channel_weights=[1., 0.])
+    >>> float(dist)
+    0.0
 
     See Also
     --------
@@ -393,6 +582,10 @@ def dtw_path(
     if be.shape(s1)[1] != be.shape(s2)[1]:
         raise ValueError("All input time series must have the same feature size.")
 
+    channel_weights = _check_channel_weights(
+        channel_weights, be.shape(s1)[1], be=be
+    )
+
     mask = compute_mask(
         s1,
         s2,
@@ -402,7 +595,12 @@ def dtw_path(
         be=be,
     )
     if be.is_numpy:
-        acc_cost_mat = njit_accumulated_matrix(s1, s2, mask=mask)
+        if channel_weights is None:
+            acc_cost_mat = njit_accumulated_matrix(s1, s2, mask=mask)
+        else:
+            acc_cost_mat = njit_accumulated_matrix_weighted(
+                s1, s2, mask=mask, weights=channel_weights
+            )
         path = _njit_return_path(acc_cost_mat)
     else:
         acc_cost_mat = accumulated_matrix(s1, s2, mask=mask, be=be)
@@ -675,6 +873,7 @@ def dtw(
     sakoe_chiba_radius=None,
     itakura_max_slope=None,
     be=None,
+    channel_weights=None,
 ):
     r"""Compute Dynamic Time Warping (DTW) similarity measure between
     (possibly multidimensional) time series and return it.
@@ -687,6 +886,9 @@ def dtw(
         DTW(X, Y) = \sqrt{\sum_{(i, j) \in \pi} \|X_{i} - Y_{j}\|^2}
 
     Note that this formula is still valid for the multivariate case.
+    If `channel_weights` is provided, the local cost of aligning :math:`X_i`
+    with :math:`Y_j` becomes :math:`\sum_c w_c (X_{i,c} - Y_{j,c})^2` and all
+    channels share the same optimal alignment path.
 
     It is not required that both time series share the same size, but they must
     be the same dimension. DTW was originally presented in [1]_ and is
@@ -734,6 +936,14 @@ def dtw(
         If `be` is `None`, the backend is determined by the input arrays.
         See our :ref:`dedicated user-guide page <backend>` for more information.
 
+    channel_weights : array-like, shape=(d,) or None (default: None)
+        Non-negative channel weights used to compute the local alignment
+        cost. Must be a one-dimensional real-valued vector of length `d`
+        with finite entries and at least one positive entry. Weights are used
+        as provided (they are not normalized). If None, all channels have
+        weight 1, which recovers the standard DTW. Channel weights are only
+        supported with the NumPy backend.
+
     Returns
     -------
     float
@@ -745,9 +955,13 @@ def dtw(
     0.0
     >>> dtw([1, 2, 3], [1., 2., 2., 3., 4.])
     1.0
+    >>> dtw([[0., 0.], [1., 1.]], [[0., 1.], [1., 0.]],
+    ...     channel_weights=[1., 0.])
+    0.0
 
-    The PyTorch backend can be used to compute gradients:
-    
+    The PyTorch backend can be used to compute gradients (channel weights are
+    only available with the NumPy backend):
+
     >>> import torch
     >>> s1 = torch.tensor([[1.0], [2.0], [3.0]], requires_grad=True)
     >>> s2 = torch.tensor([[3.0], [4.0], [-3.0]])
@@ -795,6 +1009,10 @@ def dtw(
     if be.shape(s1)[1] != be.shape(s2)[1]:
         raise ValueError("All input time series must have the same feature size.")
 
+    channel_weights = _check_channel_weights(
+        channel_weights, be.shape(s1)[1], be=be
+    )
+
     mask = compute_mask(
         s1,
         s2,
@@ -804,7 +1022,9 @@ def dtw(
         be=be,
     )
     if be.is_numpy:
-        return _njit_dtw(s1, s2, mask=mask)
+        if channel_weights is None:
+            return _njit_dtw(s1, s2, mask=mask)
+        return _njit_dtw_weighted(s1, s2, mask=mask, weights=channel_weights)
     return _dtw(s1, s2, mask=mask, be=be)
 
 
@@ -1844,6 +2064,7 @@ def cdist_dtw(
     n_jobs=None,
     verbose=0,
     be=None,
+    channel_weights=None,
 ):
     r"""Compute cross-similarity matrix using Dynamic Time Warping (DTW)
     similarity measure.
@@ -1856,6 +2077,9 @@ def cdist_dtw(
         DTW(X, Y) = \sqrt{\sum_{(i, j) \in \pi} \|X_{i} - Y_{j}\|^2}
 
     Note that this formula is still valid for the multivariate case.
+    If `channel_weights` is provided, the local cost of aligning :math:`X_i`
+    with :math:`Y_j` becomes :math:`\sum_c w_c (X_{i,c} - Y_{j,c})^2` and all
+    channels share the same optimal alignment path.
 
     It is not required that time series share the same size, but they
     must be the same dimension.
@@ -1924,6 +2148,14 @@ def cdist_dtw(
         If `be` is `None`, the backend is determined by the input arrays.
         See our :ref:`dedicated user-guide page <backend>` for more information.
 
+    channel_weights : array-like, shape=(d,) or None (default: None)
+        Non-negative channel weights used to compute the local alignment
+        cost. Must be a one-dimensional real-valued vector of length `d`
+        with finite entries and at least one positive entry. Weights are used
+        as provided (they are not normalized). If None, all channels have
+        weight 1, which recovers the standard DTW. Channel weights are only
+        supported with the NumPy backend.
+
     Returns
     -------
     cdist : array-like, shape=(n_ts1, n_ts2)
@@ -1937,6 +2169,9 @@ def cdist_dtw(
     >>> cdist_dtw([[1, 2, 2, 3], [1., 2., 3., 4.]], [[1, 2, 3], [2, 3, 4, 5]])
     array([[0.        , 2.44948974],
            [1.        , 1.41421356]])
+    >>> cdist_dtw([[[0., 0.], [1., 1.]]], [[[0., 1.], [1., 0.]]],
+    ...           channel_weights=[1., 0.])
+    array([[0.]])
 
     See Also
     --------
@@ -1949,6 +2184,11 @@ def cdist_dtw(
            Signal Processing, vol. 26(1), pp. 43--49, 1978.
     """  # noqa: E501
     be = instantiate_backend(be, dataset1, dataset2)
+    if channel_weights is not None:
+        # Validate early (before any distance is computed) so that invalid
+        # weights are rejected before the parallel computation starts.
+        d = to_time_series_dataset(dataset1, be=be).shape[2]
+        channel_weights = _check_channel_weights(channel_weights, d, be=be)
     return _cdist_generic(
         dist_fun=dtw,
         dataset1=dataset1,
@@ -1960,6 +2200,7 @@ def cdist_dtw(
         sakoe_chiba_radius=sakoe_chiba_radius,
         itakura_max_slope=itakura_max_slope,
         be=be,
+        channel_weights=channel_weights,
     )
 
 
