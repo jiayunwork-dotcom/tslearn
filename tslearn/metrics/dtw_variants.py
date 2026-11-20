@@ -88,6 +88,58 @@ def _check_channel_weights(channel_weights, d, be=None):
     return w
 
 
+def _check_max_dist(max_dist, be=None):
+    """Validate a distance cutoff for early-terminated DTW computations.
+
+    Parameters
+    ----------
+    max_dist : real number or None
+        Candidate cutoff. If None, no cutoff is applied and None is returned.
+    be : Backend object or string or None
+        Backend. A non-None cutoff is only supported with the NumPy backend.
+
+    Returns
+    -------
+    max_dist : float or None
+        The cutoff as a Python float, or None if `max_dist` was None.
+
+    Raises
+    ------
+    ValueError
+        If the backend is not NumPy, or if `max_dist` is not a finite,
+        non-negative, real-valued scalar (booleans are rejected).
+    """
+    if max_dist is None:
+        return None
+    be = instantiate_backend(be)
+    if not be.is_numpy:
+        raise ValueError(
+            "max_dist is only supported with the NumPy backend, "
+            "got backend %r." % be
+        )
+    if isinstance(max_dist, (bool, numpy.bool_)):
+        raise ValueError("max_dist must be a real number, not a boolean.")
+    arr = numpy.asarray(max_dist)
+    if arr.dtype == numpy.bool_ or not (
+        numpy.issubdtype(arr.dtype, numpy.integer)
+        or numpy.issubdtype(arr.dtype, numpy.floating)
+    ):
+        raise ValueError(
+            "max_dist must be a real number, got %r." % (max_dist,)
+        )
+    if arr.ndim != 0:
+        raise ValueError(
+            "max_dist must be a scalar, got an array with %d dimensions."
+            % arr.ndim
+        )
+    value = float(arr)
+    if not numpy.isfinite(value):
+        raise ValueError("max_dist must be finite, got %r." % (value,))
+    if value < 0.0:
+        raise ValueError("max_dist must be non-negative, got %r." % (value,))
+    return value
+
+
 @njit()
 def _njit_local_squared_dist(x, y):
     """Compute the squared distance between two vectors.
@@ -329,6 +381,171 @@ def _njit_dtw_weighted(s1, s2, mask, weights):
     """
     cum_sum = njit_accumulated_matrix_weighted(s1, s2, mask, weights)
     return numpy.sqrt(cum_sum[-1, -1])
+
+
+@njit(nogil=True)
+def _njit_dtw_bounded(s1, s2, mask, max_dist):
+    """Compute DTW between two time series with early termination.
+
+    The dynamic-programming recurrence is exactly the one of
+    `njit_accumulated_matrix` (same cell visitation order, same `min`
+    operations), so returned distances are bit-wise identical to
+    `_njit_dtw` whenever the true distance does not exceed `max_dist`.
+    After each row of the accumulated cost matrix, the smallest
+    accumulated cost in that row is compared to `max_dist ** 2` (up to a
+    small floating-point safety margin): since local costs are
+    non-negative, any complete warping path has a cost at least equal to
+    that row minimum, hence the computation can be stopped early and
+    `inf` can be returned as soon as it is certified that the true
+    distance is strictly larger than `max_dist`.
+
+    Parameters
+    ----------
+    s1 : array-like, shape=(sz1, d)
+        First time series.
+    s2 : array-like, shape=(sz2, d)
+        Second time series.
+    mask : array-like, shape=(sz1, sz2) or None
+        Mask. Unconsidered cells must have infinite values. If None, all
+        cells are considered (unconstrained DTW) and no mask is
+        allocated.
+    max_dist : float
+        Distance cutoff (use `numpy.inf` for no cutoff).
+
+    Returns
+    -------
+    dtw_score : float
+        The exact Dynamic Time Warping score if it does not exceed
+        `max_dist` (a distance exactly equal to `max_dist` is returned,
+        not rejected), and `numpy.inf` otherwise (including the case of
+        an infeasible constraint mask).
+    n_cells : int
+        Number of dynamic-programming cells that were actually computed
+        (smaller than ``sz1 * sz2`` when early termination kicked in).
+    """
+    l1 = s1.shape[0]
+    l2 = s2.shape[0]
+    threshold = max_dist * max_dist
+    # Floating-point safety margin so that a true distance exactly equal
+    # to max_dist is never rejected because of rounding in the squared
+    # domain. This only makes early termination slightly more
+    # conservative, never wrong.
+    threshold = threshold + threshold * 1e-12 + 1e-300
+    prev = numpy.full(l2 + 1, numpy.inf)
+    cur = numpy.full(l2 + 1, numpy.inf)
+    prev[0] = 0.0
+    n_cells = 0
+    for i in range(l1):
+        cur[:] = numpy.inf
+        row_min = numpy.inf
+        for j in range(l2):
+            if mask is None or numpy.isfinite(mask[i, j]):
+                cost = _njit_local_squared_dist(s1[i], s2[j])
+                cost += min(prev[j + 1], cur[j], prev[j])
+                cur[j + 1] = cost
+                if cost < row_min:
+                    row_min = cost
+                n_cells += 1
+        if row_min > threshold:
+            return numpy.inf, n_cells
+        prev, cur = cur, prev
+    dist = numpy.sqrt(prev[l2])
+    if dist <= max_dist:
+        return dist, n_cells
+    return numpy.inf, n_cells
+
+
+@njit(nogil=True)
+def _njit_dtw_bounded_weighted(s1, s2, mask, weights, max_dist):
+    """Channel-weighted variant of `_njit_dtw_bounded`.
+
+    Parameters
+    ----------
+    s1 : array-like, shape=(sz1, d)
+        First time series.
+    s2 : array-like, shape=(sz2, d)
+        Second time series.
+    mask : array-like, shape=(sz1, sz2) or None
+        Mask. Unconsidered cells must have infinite values. If None, all
+        cells are considered (unconstrained DTW).
+    weights : array-like, shape=(d,)
+        Non-negative channel weights.
+    max_dist : float
+        Distance cutoff (use `numpy.inf` for no cutoff).
+
+    Returns
+    -------
+    dtw_score : float
+        The exact channel-weighted DTW score if it does not exceed
+        `max_dist`, and `numpy.inf` otherwise.
+    n_cells : int
+        Number of dynamic-programming cells that were actually computed.
+    """
+    l1 = s1.shape[0]
+    l2 = s2.shape[0]
+    threshold = max_dist * max_dist
+    threshold = threshold + threshold * 1e-12 + 1e-300
+    prev = numpy.full(l2 + 1, numpy.inf)
+    cur = numpy.full(l2 + 1, numpy.inf)
+    prev[0] = 0.0
+    n_cells = 0
+    for i in range(l1):
+        cur[:] = numpy.inf
+        row_min = numpy.inf
+        for j in range(l2):
+            if mask is None or numpy.isfinite(mask[i, j]):
+                cost = _njit_local_squared_dist_weighted(
+                    s1[i], s2[j], weights
+                )
+                cost += min(prev[j + 1], cur[j], prev[j])
+                cur[j + 1] = cost
+                if cost < row_min:
+                    row_min = cost
+                n_cells += 1
+        if row_min > threshold:
+            return numpy.inf, n_cells
+        prev, cur = cur, prev
+    dist = numpy.sqrt(prev[l2])
+    if dist <= max_dist:
+        return dist, n_cells
+    return numpy.inf, n_cells
+
+
+def _dtw_cells_exact(s1, s2, mask, channel_weights, max_dist):
+    """Exact DTW with optional cutoff, also counting visited DP cells.
+
+    This internal helper is the single exact-DTW engine used by the
+    pruned nearest-neighbor search (`tslearn.neighbors` with
+    ``dtw_search='pruned'``). It never returns approximate distances:
+    the returned score is the exact DTW whenever it does not exceed
+    `max_dist`, and `numpy.inf` otherwise.
+
+    Parameters
+    ----------
+    s1 : array-like, shape=(sz1, d)
+        First time series (NumPy arrays, no NaN/inf).
+    s2 : array-like, shape=(sz2, d)
+        Second time series.
+    mask : array-like, shape=(sz1, sz2) or None
+        Constraint mask (infinite values mark forbidden cells), or None
+        for an unconstrained computation.
+    channel_weights : array-like, shape=(d,) or None
+        Non-negative channel weights, or None for unweighted DTW.
+    max_dist : float or None
+        Distance cutoff. None means no cutoff.
+
+    Returns
+    -------
+    dtw_score : float
+        Exact DTW score if <= max_dist, else numpy.inf.
+    n_cells : int
+        Number of dynamic-programming cells actually computed.
+    """
+    if max_dist is None:
+        max_dist = numpy.inf
+    if channel_weights is None:
+        return _njit_dtw_bounded(s1, s2, mask, max_dist)
+    return _njit_dtw_bounded_weighted(s1, s2, mask, channel_weights, max_dist)
 
 
 def _dtw(s1, s2, mask, be=None):
@@ -874,6 +1091,7 @@ def dtw(
     itakura_max_slope=None,
     be=None,
     channel_weights=None,
+    max_dist=None,
 ):
     r"""Compute Dynamic Time Warping (DTW) similarity measure between
     (possibly multidimensional) time series and return it.
@@ -944,10 +1162,24 @@ def dtw(
         weight 1, which recovers the standard DTW. Channel weights are only
         supported with the NumPy backend.
 
+    max_dist : float or None (default: None)
+        If not None, must be a finite, non-negative real number (booleans
+        are rejected). The DTW computation is then allowed to stop as soon
+        as it is certified that the true distance is strictly larger than
+        `max_dist`: in that case `numpy.inf` is returned. If the true
+        distance does not exceed `max_dist`, the exact distance is
+        returned (a true distance exactly equal to `max_dist` is
+        returned, not rejected). This is useful for nearest-neighbor
+        searches that only need to know whether a candidate can beat the
+        current k-th best distance. `max_dist` is only supported with
+        the NumPy backend; other backends raise a `ValueError` when it is
+        not None. `None` (the default) preserves the standard behavior.
+
     Returns
     -------
     float
-        Similarity score
+        Similarity score (or `numpy.inf` when the true score exceeds a
+        non-None `max_dist`)
 
     Examples
     --------
@@ -958,6 +1190,10 @@ def dtw(
     >>> dtw([[0., 0.], [1., 1.]], [[0., 1.], [1., 0.]],
     ...     channel_weights=[1., 0.])
     0.0
+    >>> dtw([1, 2, 3], [1., 2., 2., 3., 4.], max_dist=0.5)
+    inf
+    >>> dtw([1, 2, 3], [1., 2., 2., 3., 4.], max_dist=1.0)
+    1.0
 
     The PyTorch backend can be used to compute gradients (channel weights are
     only available with the NumPy backend):
@@ -998,6 +1234,7 @@ def dtw(
 
     """  # noqa: E501
     be = instantiate_backend(be, s1, s2)
+    max_dist = _check_max_dist(max_dist, be=be)
     s1 = to_time_series(s1, remove_nans=True, be=be)
     s2 = to_time_series(s2, remove_nans=True, be=be)
 
@@ -1022,6 +1259,10 @@ def dtw(
         be=be,
     )
     if be.is_numpy:
+        if max_dist is not None:
+            return _dtw_cells_exact(
+                s1, s2, mask, channel_weights, max_dist
+            )[0]
         if channel_weights is None:
             return _njit_dtw(s1, s2, mask=mask)
         return _njit_dtw_weighted(s1, s2, mask=mask, weights=channel_weights)

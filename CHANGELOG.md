@@ -14,6 +14,22 @@ Changelogs for this project are recorded in this file since v0.2.0.
 
 ### Added
 
+* Option `max_dist` in `dtw`: when set to a finite, non-negative real
+number, the computation stops early and returns `inf` as soon as the true
+distance is certified to exceed the cutoff (an exact distance equal to the
+cutoff is still returned). NumPy backend only; `None` keeps the standard
+behavior.
+* Option `dtw_search` in `KNeighborsTimeSeries`,
+`KNeighborsTimeSeriesClassifier` and `KNeighborsTimeSeriesRegressor`:
+`'brute'` (default, historical full distance matrix behavior) or
+`'pruned'`, an exact k-nearest-neighbor search for `metric='dtw'` that
+combines per-channel summary lower bounds with early-terminated exact DTW
+(`max_dist`) to skip candidates that cannot make it into the k nearest
+ones. Neighbors, distances, probabilities and predictions are identical
+to the brute-force path (ties broken by training row index), while no
+Q x N distance matrix is built. Supports multivariate and
+variable-length series, `channel_weights` and Sakoe-Chiba/Itakura
+constraints. Work counters are exposed through `search_stats_`.
 * Option `channel_weights` in `dtw`, `dtw_path` and `cdist_dtw` to compute
 DTW with per-channel weights (all channels still share a single alignment
 path). NumPy backend only.

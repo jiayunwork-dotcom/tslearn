@@ -213,6 +213,36 @@ centers by :class:`tslearn.clustering.TimeSeriesKMeans` (see
 :ref:`dtw-barycenters`).
 
 
+.. _dtw-max-dist:
+
+Early-terminated DTW (``max_dist``)
+-----------------------------------
+
+:func:`tslearn.metrics.dtw` accepts an optional ``max_dist`` cutoff.
+When it is set (a finite, non-negative real number; booleans are
+rejected), the dynamic-programming computation is allowed to stop as
+soon as it is certified that the true DTW distance is strictly larger
+than the cutoff, and ``numpy.inf`` is returned in that case. If the
+true distance does not exceed ``max_dist``, the exact distance is
+returned — a true distance exactly equal to ``max_dist`` is returned,
+not rejected:
+
+.. code-block:: python
+
+    from tslearn.metrics import dtw
+
+    dtw(x, y, max_dist=2.0)   # exact distance if <= 2.0, else inf
+
+This is useful for nearest-neighbor searches that only need to know
+whether a candidate can beat the current k-th best distance, and it is
+what powers ``dtw_search='pruned'`` in :mod:`tslearn.neighbors` (see
+:ref:`neighbors`). ``max_dist`` is only supported with the NumPy
+backend; other backends raise a ``ValueError`` when it is not ``None``.
+The default ``max_dist=None`` preserves the standard behavior, and
+:func:`tslearn.metrics.cdist_dtw` always computes the full exact
+cross-distance matrix (no cutoff can be passed to it).
+
+
 .. _dtw-barycenters:
 
 Barycenters

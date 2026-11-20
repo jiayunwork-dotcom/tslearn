@@ -8,6 +8,7 @@ User Guide
     lcss
     kernel
     clustering
+    neighbors
     shapelets
     matrix-profile
     early
