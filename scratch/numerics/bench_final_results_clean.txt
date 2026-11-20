@@ -1,0 +1,2 @@
+adaptive   best_of_3=1.647s n_iter=13 inertia=15.1065 obj=15.6009
+standard   best_of_3=2.036s n_iter=6 inertia=43.7493 obj=n/a

@@ -1,3 +1,4 @@
+import math
 import numbers
 
 import numpy
@@ -7,8 +8,26 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.utils import check_random_state
 
 from ..metrics import dtw_path
-from ..metrics.dtw_variants import _check_channel_weights
-from ..utils import to_time_series_dataset, ts_size
+from ..metrics._numerics import (
+    NonRepresentableNumericalState,
+    _SQUARE_SAFE_BOUND,
+    _scale_exponent_from_log2_bound,
+    per_channel_costs_scaled,
+    stable_entropy_solve,
+    unscale_or_inf,
+    unscale_value,
+)
+from ..metrics.dtw_variants import (
+    GLOBAL_CONSTRAINT_CODE,
+    _check_channel_weights,
+    _njit_return_path,
+    compute_mask,
+    njit_accumulated_matrix,
+    njit_accumulated_matrix_weighted,
+    needs_scaled_kernel,
+    scaled_dtw_pair,
+)
+from ..utils import to_time_series, to_time_series_dataset, ts_size
 from .utils import _set_weights
 
 __author__ = 'Romain Tavenard romain.tavenard[at]univ-rennes2.fr'
@@ -115,7 +134,8 @@ def _solve_channel_weights_entropy(per_channel_costs, regularization,
                                    min_weight):
     """Minimize a linear-plus-entropy objective over a capped simplex.
 
-    Solves, for non-negative per-channel costs ``A_c``,
+    Solves, for non-negative per-channel costs ``A_c`` (finite or
+    ``+inf``),
 
     .. math::
 
@@ -124,13 +144,22 @@ def _solve_channel_weights_entropy(per_channel_costs, regularization,
 
     The KKT conditions give :math:`w_c = \\max(\\varepsilon,
     \\exp((-\\mu - A_c)/\\lambda - 1))` where the dual variable
-    :math:`\\mu` is the unique root of :math:`\\sum_c w_c(\\mu) = d`, found
-    here by bisection.
+    :math:`\\mu` is the unique root of :math:`\\sum_c w_c(\\mu) = d`.
+
+    The numerical work is delegated to
+    :func:`tslearn.metrics._numerics.stable_entropy_solve`, a stable
+    KKT reformulation (shifted costs, bounded bisection variable) that
+    stays exact when ``A_c`` spans the whole float64 range: the previous
+    direct implementation evaluated ``exp((-mu - A) / lam - 1)`` and
+    silently produced weights whose sum violated the simplex constraint as
+    soon as ``A`` reached ~1e16.
 
     Parameters
     ----------
     per_channel_costs : numpy.ndarray of shape (d,)
-        Non-negative per-channel alignment costs ``A_c``.
+        Non-negative per-channel alignment costs ``A_c`` (entries may be
+        ``+inf`` for channels whose true cost is not representable; such
+        channels are pinned to the lower bound).
     regularization : float
         Positive entropy regularization coefficient :math:`\\lambda`.
     min_weight : float
@@ -139,53 +168,11 @@ def _solve_channel_weights_entropy(per_channel_costs, regularization,
     Returns
     -------
     w : numpy.ndarray of shape (d,)
-        Optimal weights with ``w.sum() == d`` (up to machine precision) and
-        ``w >= min_weight``.
+        Optimal weights with ``w.sum() == d`` exactly (up to machine
+        precision) and ``w >= min_weight``.
     """
-    A = numpy.asarray(per_channel_costs, dtype=numpy.float64)
-    d = A.shape[0]
-    if d == 1:
-        # The only feasible weight is 1 (sum must be d = 1).
-        return numpy.ones((1,))
-    eps = float(min_weight)
-    lam = float(regularization)
-
-    def capped_weights(mu):
-        w = numpy.exp((-mu - A) / lam - 1.0)
-        numpy.maximum(w, eps, out=w)
-        return w
-
-    # total(mu) is continuous and decreasing in mu, from +inf (mu -> -inf)
-    # to d * eps < d (mu -> +inf): a unique mu with total(mu) == d exists.
-    step = max(lam, 1.0)
-    mu_lo = 0.0
-    while capped_weights(mu_lo).sum() < d:
-        mu_lo -= step
-        step *= 2.0
-    step = max(lam, 1.0)
-    mu_hi = 0.0
-    while capped_weights(mu_hi).sum() > d:
-        mu_hi += step
-        step *= 2.0
-    for _ in range(200):  # 200 halvings: far beyond float64 resolution
-        mu_mid = 0.5 * (mu_lo + mu_hi)
-        if capped_weights(mu_mid).sum() > d:
-            mu_lo = mu_mid
-        else:
-            mu_hi = mu_mid
-    w = capped_weights(mu_hi)
-    # Enforce the constraints exactly (up to machine precision): clip below
-    # eps and absorb the residual on the free (non-pinned) entries.
-    for _ in range(3):
-        numpy.maximum(w, eps, out=w)
-        excess = w.sum() - d
-        if excess <= 0.0:
-            break
-        free = w > eps
-        if not numpy.any(free):
-            break
-        w[free] *= (w[free].sum() - excess) / w[free].sum()
-    return w
+    return stable_entropy_solve(per_channel_costs, regularization,
+                                min_weight)
 
 
 def _per_channel_costs(X, barycenter, list_p_k, weights):
@@ -209,18 +196,183 @@ def _per_channel_costs(X, barycenter, list_p_k, weights):
         (sample-weighted) average of the fixed-path alignment costs, i.e.
         ``A_c = sum_k weights[k] * sum_{(t, j) in p_k}
         (barycenter[t, c] - X[k, j, c])**2 / sum(weights)``.
+
+    Notes
+    -----
+    The accumulation runs through
+    :func:`tslearn.metrics._numerics.per_channel_costs_scaled`: each
+    channel gets a power-of-two rescaling chosen from its actual
+    differences, so intermediate squares and weighted sums cannot overflow
+    even when the inputs sit at the float64 magnitude limit. Entries whose
+    true cost is not representable come back as ``+inf`` and are handled by
+    the capped-simplex solver (the corresponding weight is pinned to its
+    lower bound).
     """
-    d = X.shape[2]
-    acc = numpy.zeros((d,))
-    for k, p_k in enumerate(list_p_k):
-        if weights[k] == 0.0:
+    costs, _ = per_channel_costs_scaled(X, barycenter, list_p_k, weights)
+    return costs
+
+
+def _robust_assignment(barycenter, x_i, metric_params):
+    """DTW alignment of one series against the barycenter, overflow-safe.
+
+    Mirrors :func:`dtw_path` but returns the optimal path together with the
+    squared cost kept in its scaled representation
+    ``(scaled_sq_cost, scale_log2)`` so that callers can average several
+    such costs without ever materializing an overflowing individual term.
+    The path is identical to the unscaled optimum because a common positive
+    scaling preserves arg-min decisions.
+
+    On ordinary-magnitude finite data this takes the classic numba fast
+    path directly; the rescaled machinery is only entered when an
+    intermediate square or accumulation could actually overflow.
+    """
+    channel_weights = metric_params.get("channel_weights")
+    constraint_code = GLOBAL_CONSTRAINT_CODE[
+        metric_params.get("global_constraint")
+    ]
+    # Fast path: plain float64 arrays with no NaN padding and no overflow
+    # risk. Avoids the per-call to_time_series bookkeeping cost on the hot
+    # training loop while still using the canonical constraint mask builder.
+    plain = (
+        isinstance(barycenter, numpy.ndarray)
+        and isinstance(x_i, numpy.ndarray)
+        and barycenter.dtype == numpy.float64
+        and x_i.dtype == numpy.float64
+        and numpy.all(numpy.isfinite(barycenter))
+        and numpy.all(numpy.isfinite(x_i))
+    )
+    if plain:
+        s1 = barycenter
+        s2 = x_i
+    else:
+        s1 = numpy.ascontiguousarray(
+            to_time_series(barycenter, remove_nans=True),
+            dtype=numpy.float64,
+        )
+        s2 = numpy.ascontiguousarray(
+            to_time_series(x_i, remove_nans=True), dtype=numpy.float64
+        )
+    mask = compute_mask(
+        s1,
+        s2,
+        constraint_code,
+        sakoe_chiba_radius=metric_params.get("sakoe_chiba_radius"),
+        itakura_max_slope=metric_params.get("itakura_max_slope"),
+    )
+    if not needs_scaled_kernel(s1, s2, channel_weights):
+        if channel_weights is None:
+            acc = njit_accumulated_matrix(s1, s2, mask=mask)
+        else:
+            w = numpy.ascontiguousarray(channel_weights,
+                                        dtype=numpy.float64)
+            acc = njit_accumulated_matrix_weighted(
+                s1, s2, mask=mask, weights=w
+            )
+        path = _njit_return_path(acc)
+        return path, float(acc[-1, -1]), 0.0
+
+    path, scaled_sq, scale_log2, overflowed = scaled_dtw_pair(
+        s1, s2, mask, channel_weights
+    )
+    if overflowed:
+        raise NonRepresentableNumericalState(
+            "An alignment cost used during barycenter training exceeds the "
+            "float64 range and cannot be averaged into a finite objective."
+        )
+    return path, scaled_sq, scale_log2
+
+
+def _scaled_weighted_average(sq_costs_scaled, scales_log2, sample_weights):
+    """Weighted mean of squared DTW costs kept in scaled form.
+
+    ``sq_costs_scaled[i]`` is the squared cost of series ``i`` divided by
+    ``2 ** (2 * scales_log2[i])``. The mean is evaluated at a common scale
+    (the largest of the per-pair scales) in log-space-safe exponent
+    arithmetic, so neither the individual terms nor their weighted sum can
+    overflow. Returns ``(mean_scaled, common_scale_log2)``; the true mean is
+    recovered with :func:`unscale_value` (or flagged non-representable).
+    """
+    common_scale = float(numpy.max(scales_log2))
+    sample_weights = numpy.asarray(sample_weights, dtype=numpy.float64)
+    # Normalize the sample weights by their own maximum: a common positive
+    # rescaling of the weights leaves a weighted mean unchanged (the
+    # factors cancel) and keeps every accumulator product finite even when
+    # the raw weights sit at the float64 magnitude limit. Input weights are
+    # strictly validated as finite with at least one positive entry.
+    w_max = float(numpy.max(sample_weights))
+    if w_max <= 0.0 or not numpy.isfinite(w_max):
+        raise NonRepresentableNumericalState(
+            "Weighted averaging requires at least one finite positive "
+            "sample weight."
+        )
+    normalized_w = sample_weights / w_max
+    total_w = float(numpy.sum(normalized_w))
+    # Fast path for ordinary data: every cost was evaluated at the natural
+    # scale. Even then their raw sum can overflow (e.g. two finite squared
+    # costs of 1e308 average to a representable 1e308), so suppress the
+    # numpy overflow warning and fall through to the rescaled accumulation
+    # when a direct reduction saturates.
+    if common_scale == 0.0:
+        sq_arr = numpy.asarray(sq_costs_scaled, dtype=numpy.float64)
+        with numpy.errstate(over="ignore"):
+            direct = float(
+                numpy.sum(normalized_w * sq_arr)
+            ) / total_w
+        if numpy.isfinite(direct):
+            return direct, 0.0
+    # Choose an additional accumulation scale from the largest term as
+    # expressed at the common scale: averaging several finite terms can
+    # otherwise overflow even when their mean is perfectly representable
+    # (e.g. the mean of two 1e308 costs is 1e308, while their raw sum
+    # saturates). Measured in log space so the bound itself cannot overflow.
+    max_term_log2 = -numpy.inf
+    for scaled_sq, e in zip(sq_costs_scaled, scales_log2):
+        if scaled_sq > 0.0 and numpy.isfinite(scaled_sq):
+            term_log2 = math.log2(float(scaled_sq)) - 2.0 * (
+                common_scale - float(e)
+            )
+            if term_log2 > max_term_log2:
+                max_term_log2 = term_log2
+    if numpy.isinf(max_term_log2):
+        extra_scale = 0.0
+    else:
+        # The numerator adds at most n finite terms; cover that worst case,
+        # the final division by total_w can only reduce the magnitude.
+        extra_scale = _scale_exponent_from_log2_bound(
+            max_term_log2 + math.log2(float(len(sq_costs_scaled)))
+        )
+    acc = 0.0
+    for scaled_sq, e, w in zip(sq_costs_scaled, scales_log2,
+                               normalized_w):
+        if w == 0.0:
             continue
-        x_k = X[k][:ts_size(X[k])]
-        bary_idx = numpy.array([t for (t, _) in p_k], dtype=numpy.intp)
-        samp_idx = numpy.array([j for (_, j) in p_k], dtype=numpy.intp)
-        diff = barycenter[bary_idx] - x_k[samp_idx]
-        acc += weights[k] * (diff * diff).sum(axis=0)
-    return acc / weights.sum()
+        # Bring this term to the common scale and then apply the extra
+        # accumulation scale (pure exponent changes, never overflowing).
+        delta = common_scale - float(e)
+        at_common = scaled_sq * (
+            1.0 if delta == 0.0 else numpy.float64(2.0 ** (-delta))
+        )
+        if extra_scale > 0.0:
+            at_common = at_common * numpy.float64(2.0 ** (-extra_scale))
+        acc += w * at_common
+    mean_scaled = acc / total_w
+    if not numpy.isfinite(mean_scaled):
+        raise NonRepresentableNumericalState(
+            "The weighted average of alignment costs is not finite; the "
+            "training objective cannot be represented in float64."
+        )
+    # The common scale divides squared terms by 2**(2 * common_scale); the
+    # extra accumulation rescaling divides the already-scaled squared
+    # numerator once more by 2**extra_scale (note the single, not doubled,
+    # exponent because it is applied after the squared terms are formed).
+    return mean_scaled, 2.0 * common_scale + extra_scale
+
+
+def _true_or_inf_scaled(mean_scaled, scale_log2):
+    """Materialize a scaled objective value, returning +inf on overflow."""
+    if not numpy.isfinite(mean_scaled):
+        return numpy.inf
+    return unscale_or_inf(mean_scaled, scale_log2)
 
 
 def _init_avg(X, barycenter_size):
@@ -419,15 +571,43 @@ def _mm_assignment(X, barycenter, weights, metric_params=None):
     """
     if metric_params is None:
         metric_params = {}
-    n = X.shape[0]
-    cost = 0.
     list_p_k = []
-    for i in range(n):
-        path, dist_i = dtw_path(barycenter, X[i], **metric_params)
-        cost += dist_i ** 2 * weights[i]
+    sq_scaled = []
+    scales = []
+    for i in range(X.shape[0]):
+        path, scaled_sq, scale_log2 = _robust_assignment(
+            barycenter, X[i], metric_params
+        )
         list_p_k.append(path)
-    cost /= weights.sum()
+        if weights[i] == 0.0:
+            sq_scaled.append(0.0)
+            scales.append(0.0)
+        else:
+            sq_scaled.append(scaled_sq)
+            scales.append(scale_log2)
+    mean_scaled, mean_scale = _scaled_weighted_average(
+        sq_scaled, scales, numpy.asarray(weights, dtype=numpy.float64)
+    )
+    cost = _true_or_inf_scaled(mean_scaled, mean_scale)
     return list_p_k, cost
+
+
+def _normalize_sample_weights(weights):
+    """Divide finite sample weights by their maximum.
+
+    A weighted mean is invariant to multiplying every weight by the same
+    positive constant, so this preserves every barycenter objective while
+    keeping the internal valence/warping coefficients bounded by one (the
+    strict validators guarantee finite non-negative weights with a positive
+    entry). The returned array is a fresh copy.
+    """
+    weights = numpy.asarray(weights, dtype=numpy.float64).copy()
+    w_max = float(numpy.max(weights))
+    if w_max <= 0.0 or not numpy.isfinite(w_max):
+        raise NonRepresentableNumericalState(
+            "Sample weights must contain a finite positive entry."
+        )
+    return weights / w_max
 
 
 def _subgradient_valence_warping(list_p_k, barycenter_size, weights):
@@ -470,8 +650,9 @@ def _subgradient_valence_warping(list_p_k, barycenter_size, weights):
     for k, p_k in enumerate(list_p_k):
         sz_k = p_k[-1][1] + 1
         w_k = numpy.zeros((barycenter_size, sz_k))
-        for i, j in p_k:
-            w_k[i, j] = 1.
+        if weights[k] != 0.0:
+            for i, j in p_k:
+                w_k[i, j] = 1.
         list_w_k.append(w_k * weights[k])
         list_v_k.append(w_k.sum(axis=1) * weights[k])
     return list_v_k, list_w_k
@@ -550,10 +731,78 @@ def _mm_update_barycenter(X, diag_sum_v_k, list_w_k):
     """
     d = X.shape[2]
     barycenter_size = diag_sum_v_k.shape[0]
+    # Fast path for ordinary-magnitude data: the original vectorized MM
+    # update, bit-for-bit identical to the v0.6.4 arithmetic.
+    if (
+        numpy.all(numpy.isfinite(X))
+        and float(numpy.max(numpy.abs(X))) <= _SQUARE_SAFE_BOUND
+    ):
+        sum_w_x = numpy.zeros((barycenter_size, d))
+        for k, (w_k, x_k) in enumerate(zip(list_w_k, X)):
+            sum_w_x += w_k.dot(x_k[:ts_size(x_k)])
+        barycenter = numpy.diag(1. / diag_sum_v_k).dot(sum_w_x)
+        if numpy.all(numpy.isfinite(barycenter)):
+            return barycenter
     sum_w_x = numpy.zeros((barycenter_size, d))
-    for k, (w_k, x_k) in enumerate(zip(list_w_k, X)):
-        sum_w_x += w_k.dot(x_k[:ts_size(x_k)])
-    barycenter = numpy.diag(1. / diag_sum_v_k).dot(sum_w_x)
+    # Each barycenter coordinate is a convex combination of finite input
+    # values, hence it is representable whenever the inputs are. The
+    # numerator and denominator are nevertheless accumulated under a
+    # per-coordinate power-of-two rescaling so intermediate matrix products
+    # cannot overflow (e.g. several 1e308-valued warping entries).
+    for t in range(barycenter_size):
+        if diag_sum_v_k[t] <= 0.0:
+            continue
+        max_abs = 0.0
+        for k, w_k in enumerate(list_w_k):
+            x_k = X[k][:ts_size(X[k])]
+            nz = numpy.flatnonzero(w_k[t])
+            if nz.size:
+                m = float(numpy.max(numpy.abs(x_k[nz])))
+                if m > max_abs:
+                    max_abs = m
+        if max_abs <= 1.0:
+            scale_log2 = 0.0
+            inv_scale = 1.0
+        else:
+            # A convex combination of values bounded by max_abs cannot
+            # exceed max_abs, so a scale making max_abs itself finite is
+            # sufficient for both the numerator and the final coordinate.
+            scale_log2 = _scale_exponent_from_log2_bound(
+                math.log2(max_abs)
+            )
+            inv_scale = numpy.float64(2.0 ** (-scale_log2))
+        numerator = numpy.zeros((d,))
+        for k, w_k in enumerate(list_w_k):
+            x_k = X[k][:ts_size(X[k])]
+            numerator += w_k[t].dot(x_k * inv_scale)
+        if not numpy.all(numpy.isfinite(numerator)):
+            raise NonRepresentableNumericalState(
+                "Barycenter coordinate %d cannot be evaluated at finite "
+                "float64 magnitude." % t
+            )
+        # The numerator already holds sum(w * (x / 2**e)); multiplying the
+        # coordinate by 2**e restores its true magnitude, and the division
+        # by diag_sum_v_k is scale-invariant (both numerator and denominator
+        # live at the same scale). Apply the division first while values
+        # are still scaled so the final matrix product cannot re-overflow.
+        if scale_log2 > 0.0:
+            coord = numpy.array([
+                unscale_value(float(v) / float(diag_sum_v_k[t]),
+                              scale_log2)
+                for v in numerator
+            ])
+        else:
+            coord = numerator / diag_sum_v_k[t]
+        sum_w_x[t] = coord
+    # diag_sum_v_k is the per-row valence total, which equals the sum of
+    # warping coefficients entering each barycenter coordinate: sum_w_x is
+    # already divided by it above, so the barycenter is sum_w_x itself.
+    barycenter = sum_w_x
+    if not numpy.all(numpy.isfinite(barycenter)):
+        raise NonRepresentableNumericalState(
+            "The updated barycenter contains non-finite entries; the "
+            "requested barycenter is not representable in float64."
+        )
     return barycenter
 
 
@@ -603,6 +852,91 @@ def _subgradient_update_barycenter(X, list_diag_v_k, list_w_k, weights_sum,
     return barycenter
 
 
+def _evaluate_scaled(bary, w, X_, weights, metric_params, regularization):
+    """Evaluate one adaptive-DBA state, keeping the data term scaled.
+
+    Returns
+    -------
+    list_p_k : list of warping paths
+    data_scaled, data_scale_log2 : float
+        Weighted mean squared DTW cost of the state, divided by
+        ``2 ** data_scale_log2`` (never materialized at its true magnitude
+        while it could overflow).
+    entropy : float
+        Entropy regularizer value (data-scale independent).
+    """
+    mp = dict(metric_params)
+    mp["channel_weights"] = w
+    sq_scaled, scales = [], []
+    list_p_k = []
+    for i in range(X_.shape[0]):
+        if weights[i] == 0.0:
+            # Zero-weight series still get a real alignment so all path
+            # matrices keep their true shapes, but their zero sample weight
+            # makes every downstream contribution vanish identically.
+            path, _, _ = _robust_assignment(bary, X_[i], mp)
+            list_p_k.append(path)
+            sq_scaled.append(0.0)
+            scales.append(0.0)
+            continue
+        path, scaled_sq, scale_log2 = _robust_assignment(bary, X_[i], mp)
+        list_p_k.append(path)
+        sq_scaled.append(scaled_sq)
+        scales.append(scale_log2)
+    data_scaled, data_scale_log2 = _scaled_weighted_average(
+        sq_scaled, scales, weights
+    )
+    entropy = _entropy(w)
+    return list_p_k, data_scaled, data_scale_log2, entropy
+
+
+def _objective_scaled(data_scaled, data_scale_log2, entropy,
+                      regularization):
+    """Pack the regularized objective into a (scaled value, scale) pair.
+
+    The entropy term is finite by construction (weights are finite and
+    bounded); it is expressed in the data term's scale by dividing it by
+    the same power of two, which is exact in exponent arithmetic.
+    """
+    if data_scale_log2 == 0.0:
+        return data_scaled + regularization * entropy, 0.0
+    entropy_at_scale = regularization * entropy * numpy.float64(
+        2.0 ** (-data_scale_log2)
+    )
+    return data_scaled + entropy_at_scale, data_scale_log2
+
+
+def _accept_scaled(new_pair, old_pair, tol_factor=1e-8):
+    """Scale-invariant version of the public acceptance rule.
+
+    ``new <= old + tol_factor * max(1, |old|)`` evaluated after aligning
+    both states to a common power-of-two scale. Returns True when the new
+    state does not increase the objective beyond the tolerance.
+    """
+    new_scaled, new_scale = new_pair
+    old_scaled, old_scale = old_pair
+    common = max(new_scale, old_scale)
+    old_at_common = old_scaled * numpy.float64(
+        2.0 ** (-(common - old_scale))
+    )
+    new_at_common = new_scaled * numpy.float64(
+        2.0 ** (-(common - new_scale))
+    )
+    if not (numpy.isfinite(old_at_common)
+            and numpy.isfinite(new_at_common)):
+        # Only a strict finite improvement can be accepted once one side
+        # saturates at the common scale.
+        return new_at_common <= old_at_common
+    tolerance = tol_factor * max(1.0, abs(old_at_common))
+    return new_at_common <= old_at_common + tolerance
+
+
+def _materialize_objective(scaled_pair):
+    """True float64 objective value, or +inf when it is not representable."""
+    scaled, scale_log2 = scaled_pair
+    return _true_or_inf_scaled(scaled, scale_log2)
+
+
 def _dba_weighted_one_init(X_, barycenter, weights, init_channel_weights,
                            regularization, min_channel_weight, max_iter, tol,
                            metric_params, verbose):
@@ -613,14 +947,20 @@ def _dba_weighted_one_init(X_, barycenter, weights, init_channel_weights,
     weights, (ii) the barycenter is updated with the classic MM update
     (which is invariant to positive channel weights), (iii) the channel
     weights are updated by exactly minimizing the fixed-path surrogate plus
-    the entropy regularizer. Each of these three steps does not increase the
-    true objective
+    the entropy regularizer. Each of these three steps does not increase
+    the true objective
 
         J(b, w) = weighted average of dtw_w(b, x_k)**2
                   + regularization * sum_c w_c log(w_c),
 
     hence the recorded objective values form a non-increasing sequence (up
     to a numerical acceptance tolerance of 1e-8 * max(1, |J_previous|)).
+
+    All costs that can overflow float64 are carried in scaled
+    representations: states whose center, weights and true objective are
+    representable are accepted even when individual per-series squared
+    distances are not, while genuinely non-representable states raise
+    :class:`ValueError` instead of being delivered.
 
     Parameters
     ----------
@@ -656,7 +996,7 @@ def _dba_weighted_one_init(X_, barycenter, weights, init_channel_weights,
     objective_history : list of float
         True objective values of the accepted states, in chronological
         order. The last entry is the objective of the returned
-        (barycenter, channel_weights) pair.
+        (barycenter, channel_weights) pair and is always finite.
     """
     barycenter_size = barycenter.shape[0]
     channel_weights = init_channel_weights.copy()
@@ -665,14 +1005,14 @@ def _dba_weighted_one_init(X_, barycenter, weights, init_channel_weights,
     else:
         metric_params = dict(metric_params)
 
-    def evaluate(bary, w):
-        mp = dict(metric_params)
-        mp["channel_weights"] = w
-        list_p_k, data_cost = _mm_assignment(X_, bary, weights, mp)
-        return list_p_k, data_cost + regularization * _entropy(w)
-
-    list_p_k, objective = evaluate(barycenter, channel_weights)
-    objective_history = [objective]
+    list_p_k, data_scaled, data_scale, entropy = _evaluate_scaled(
+        barycenter, channel_weights, X_, weights, metric_params,
+        regularization
+    )
+    objective_pair = _objective_scaled(
+        data_scaled, data_scale, entropy, regularization
+    )
+    objective_history = [_materialize_objective(objective_pair)]
     for it in range(max_iter):
         diag_sum_v_k, list_w_k = _mm_valence_warping(list_p_k,
                                                      barycenter_size,
@@ -683,10 +1023,19 @@ def _dba_weighted_one_init(X_, barycenter, weights, init_channel_weights,
         new_channel_weights = _solve_channel_weights_entropy(
             per_channel, regularization, min_channel_weight
         )
-        new_list_p_k, new_objective = evaluate(new_barycenter,
-                                               new_channel_weights)
-        accept_tol = 1e-8 * max(1.0, abs(objective))
-        if new_objective > objective + accept_tol:
+        # Defensive constraint check: the solver repair step guarantees
+        # these, but never deliver a state that violates the simplex.
+        _assert_valid_learned_weights(new_channel_weights,
+                                      min_channel_weight)
+        (new_list_p_k, new_data_scaled, new_data_scale,
+         new_entropy) = _evaluate_scaled(
+            new_barycenter, new_channel_weights, X_, weights,
+            metric_params, regularization
+        )
+        new_objective_pair = _objective_scaled(
+            new_data_scaled, new_data_scale, new_entropy, regularization
+        )
+        if not _accept_scaled(new_objective_pair, objective_pair):
             # Should not happen (each update decreases the true objective in
             # exact arithmetic): refuse the increasing state and stop.
             warnings.warn(
@@ -699,15 +1048,59 @@ def _dba_weighted_one_init(X_, barycenter, weights, init_channel_weights,
         barycenter = new_barycenter
         channel_weights = new_channel_weights
         list_p_k = new_list_p_k
+        new_objective = _materialize_objective(new_objective_pair)
+        if not numpy.isfinite(new_objective):
+            raise NonRepresentableNumericalState(
+                "The adaptive DBA objective of an otherwise acceptable "
+                "state exceeds the float64 range; no finite model can be "
+                "delivered."
+            )
         objective_history.append(new_objective)
         if verbose:
             print("[Weighted DBA] epoch %d, objective: %.5f"
                   % (it + 1, new_objective))
-        if abs(objective - new_objective) < tol:
-            objective = new_objective
+        if abs(objective_history[-2] - new_objective) < tol:
+            objective_pair = new_objective_pair
             break
-        objective = new_objective
+        objective_pair = new_objective_pair
+    # Final delivery contract: the last history entry is the true objective
+    # of the returned (barycenter, weights) pair evaluated against them.
+    # The alternating loop already evaluated this exact state when it was
+    # accepted, so its scaled pair is reused: no extra alignment pass (and
+    # no extra observable state evaluation) is needed.
+    final_objective = _materialize_objective(objective_pair)
+    if not numpy.isfinite(final_objective):
+        raise NonRepresentableNumericalState(
+            "The final adaptive DBA objective is not representable in "
+            "float64; refusing to deliver an infinite-objective model."
+        )
+    if not numpy.all(numpy.isfinite(barycenter)):
+        raise NonRepresentableNumericalState(
+            "The learned barycenter contains non-finite entries."
+        )
+    _assert_valid_learned_weights(channel_weights, min_channel_weight)
+    objective_history[-1] = final_objective
     return barycenter, channel_weights, objective_history
+
+
+def _assert_valid_learned_weights(channel_weights, min_channel_weight):
+    """Raise ValueError if a learned weight vector violates its constraints."""
+    w = numpy.asarray(channel_weights, dtype=numpy.float64)
+    if not numpy.all(numpy.isfinite(w)):
+        raise NonRepresentableNumericalState(
+            "Learned channel weights must all be finite, got %r." % (w,)
+        )
+    if numpy.any(w < min_channel_weight - 1e-12):
+        raise NonRepresentableNumericalState(
+            "Learned channel weights must be at least min_channel_weight "
+            "(%r), got %r." % (min_channel_weight, w)
+        )
+    if not numpy.isclose(float(numpy.sum(w)), float(w.shape[0]),
+                         rtol=1e-9, atol=1e-12):
+        raise NonRepresentableNumericalState(
+            "Learned channel weights must sum to the number of channels "
+            "(%d), got sum %.15g." % (w.shape[0], float(numpy.sum(w)))
+        )
 
 
 def dtw_barycenter_averaging(X, barycenter_size=None, init_barycenter=None,
@@ -1022,7 +1415,9 @@ def dtw_barycenter_averaging_one_init(X, barycenter_size=None,
                 "channel_weight_regularization is set: channel weights are "
                 "then learned, not fixed."
             )
-        weights = _check_sample_weights_strict(weights, X_.shape[0])
+        weights = _normalize_sample_weights(
+            _check_sample_weights_strict(weights, X_.shape[0])
+        )
         init_channel_weights = _check_init_channel_weights(
             init_channel_weights, X_.shape[2], min_channel_weight
         )
@@ -1037,6 +1432,8 @@ def dtw_barycenter_averaging_one_init(X, barycenter_size=None,
             metric_params, verbose
         )
     weights = _set_weights(weights, X_.shape[0])
+    if numpy.isfinite(numpy.max(weights)) and numpy.max(weights) > 0.0:
+        weights = _normalize_sample_weights(weights)
     if init_barycenter is None:
         barycenter = _init_avg(X_, barycenter_size)
     else:

@@ -538,7 +538,8 @@ def dtw_barycenter_averaging_one_init_barycenter(X):
 
 
 def test_dba_adaptive_history_matches_independent_recomputation():
-    # Record every accepted state through a spy and recompute each recorded
+    # Record every accepted state through a spy on the overflow-safe
+    # per-series alignment entry point and recompute each recorded
     # objective independently (pure-Python weighted DTW).
     rng = np.random.RandomState(3)
     n, sz, d = 4, 5, 2
@@ -547,17 +548,17 @@ def test_dba_adaptive_history_matches_independent_recomputation():
     lam = 0.2
     states = []
 
-    orig_assignment = dba_module._mm_assignment
+    # The spy intercepts the state evaluation wrapper so that one recorded
+    # state corresponds to each entry of the objective history.
+    orig_evaluate = dba_module._evaluate_scaled
 
-    def spy_assignment(X_, barycenter, weights, metric_params=None):
-        paths, cost = orig_assignment(X_, barycenter, weights,
-                                      metric_params)
-        states.append((barycenter.copy(),
-                       metric_params["channel_weights"].copy(),
-                       weights.copy()))
-        return paths, cost
+    def spy_evaluate(bary, w, X_, weights, metric_params, regularization):
+        states.append((bary.copy(), w.copy(),
+                       np.asarray(weights).copy()))
+        return orig_evaluate(bary, w, X_, weights, metric_params,
+                             regularization)
 
-    with mock.patch.object(dba_module, "_mm_assignment", spy_assignment):
+    with mock.patch.object(dba_module, "_evaluate_scaled", spy_evaluate):
         bary, w, history = dtw_barycenter_averaging(
             X, channel_weight_regularization=lam, max_iter=10
         )
@@ -812,16 +813,16 @@ def test_kmeans_adaptive_history_independent_recomputation():
     lam = 0.1
     states = []
 
-    orig = TimeSeriesKMeans._transform_weighted_with_centers
+    orig = TimeSeriesKMeans._scaled_dists_with_centers
 
     def spy(self, X_, centers, channel_weights):
-        dists = orig(self, X_, centers, channel_weights)
-        states.append((centers.copy(), channel_weights.copy(),
-                       dists.argmin(axis=1)))
-        return dists
+        scaled_sq, scales = orig(self, X_, centers, channel_weights)
+        labels = self._assign_scaled(scaled_sq, scales)
+        states.append((centers.copy(), channel_weights.copy(), labels))
+        return scaled_sq, scales
 
     with mock.patch.object(TimeSeriesKMeans,
-                           "_transform_weighted_with_centers", spy):
+                           "_scaled_dists_with_centers", spy):
         km = TimeSeriesKMeans(n_clusters=2, metric="dtw", max_iter=8,
                               channel_weight_regularization=lam,
                               random_state=0).fit(X)

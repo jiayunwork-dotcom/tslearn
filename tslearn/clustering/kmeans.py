@@ -42,16 +42,23 @@ from tslearn.barycenters import (
     softdtw_barycenter,
 )
 from tslearn.barycenters.dba import (
+    _assert_valid_learned_weights,
     _check_channel_weight_regularization,
     _check_min_channel_weight,
     _entropy,
     _mm_update_barycenter,
     _mm_valence_warping,
     _per_channel_costs,
+    _robust_assignment,
+    _scale_exponent_from_log2_bound,
+    _scaled_weighted_average,
     _solve_channel_weights_entropy,
+    _true_or_inf_scaled,
+    NonRepresentableNumericalState,
 )
 from tslearn.bases import BaseModelPackage, TimeSeriesBaseEstimator
 from tslearn.metrics import cdist_dtw, cdist_gak, cdist_soft_dtw, sigma_gak
+from tslearn.metrics._numerics import unscale_value
 from tslearn.metrics.dtw_variants import dtw_path
 from tslearn.utils import (
     check_array,
@@ -771,6 +778,133 @@ class TimeSeriesKMeans(
             )[:, 0]
         return dists
 
+    def _transform_weighted_with_centers(self, X, centers, channel_weights):
+        """Distance to given centers using per-cluster channel weights.
+
+        Column `k` of the returned matrix holds the DTW distances between
+        the samples and `centers[k]`, computed with `channel_weights[k]`.
+        """
+        metric_params = self._get_metric_params()
+        dists = numpy.empty((X.shape[0], self.n_clusters))
+        for k in range(self.n_clusters):
+            dists[:, k] = cdist_dtw(
+                X,
+                centers[k: k + 1],
+                channel_weights=channel_weights[k],
+                n_jobs=self.n_jobs,
+                verbose=self.verbose,
+                **metric_params
+            )[:, 0]
+        return dists
+
+    def _scaled_dists_with_centers(self, X, centers, channel_weights):
+        """Squared distances to all centers kept in scaled representation.
+
+        Mirrors :meth:`_transform_weighted_with_centers` but returns, for
+        every sample/cluster pair, the squared weighted DTW cost divided by
+        ``2 ** (2 * scale_log2)`` together with the scale exponent, so that
+        assignment and inertia computation never have to materialize an
+        individual squared cost that overflows float64. The assignment
+        (arg-min over clusters) is evaluated at a per-sample common scale
+        and is therefore identical to comparing the true distances.
+
+        Returns
+        -------
+        scaled_sq : numpy.ndarray of shape (n_ts, n_clusters)
+        scales : numpy.ndarray of shape (n_ts, n_clusters)
+        """
+        metric_params = self._get_metric_params()
+        n_ts = X.shape[0]
+        scaled_sq = numpy.empty((n_ts, self.n_clusters))
+        scales = numpy.empty((n_ts, self.n_clusters))
+        for k in range(self.n_clusters):
+            for i in range(n_ts):
+                _, sq, scale_log2 = _robust_assignment(
+                    centers[k], X[i],
+                    dict(metric_params,
+                         channel_weights=channel_weights[k]),
+                )
+                scaled_sq[i, k] = sq
+                scales[i, k] = scale_log2
+        return scaled_sq, scales
+
+    def _assign_scaled(self, scaled_sq, scales):
+        """Arg-min assignment from per-pair scaled squared costs.
+
+        Each row is compared at its own common scale; scaling by a common
+        positive factor preserves the ordering of the cluster distances.
+        """
+        n_ts, n_clusters = scaled_sq.shape
+        labels = numpy.empty((n_ts,), dtype=numpy.intp)
+        for i in range(n_ts):
+            common = float(numpy.max(scales[i]))
+            at_common = numpy.array([
+                scaled_sq[i, k] * (
+                    1.0 if common == scales[i, k]
+                    else numpy.float64(
+                        2.0 ** (-2.0 * (common - scales[i, k]))
+                    )
+                )
+                for k in range(n_clusters)
+            ])
+            labels[i] = int(numpy.argmin(at_common))
+        return labels
+
+    def _scaled_inertia(self, scaled_sq, scales, labels):
+        """Mean assigned squared distance (the public inertia_) in scaled
+        form, returning ``(inertia_scaled, scale_log2)``.
+
+        Sample weights are uniform (one per series), so this is a plain
+        mean; the accumulation uses its own rescaling so a representable
+        average of overflowing individual terms is not rejected.
+        """
+        n_ts = scaled_sq.shape[0]
+        picked_sq = scaled_sq[numpy.arange(n_ts), labels]
+        picked_scales = scales[numpy.arange(n_ts), labels]
+        mean_scaled, mean_scale = _scaled_weighted_average(
+            list(picked_sq), list(picked_scales),
+            numpy.ones((n_ts,)),
+        )
+        return mean_scaled, mean_scale
+
+    def _objective_scaled(self, scaled_sq, scales, labels,
+                          channel_weights, regularization):
+        """Regularized objective J packed as a (scaled value, scale) pair.
+
+        The entropy term is scale independent and finite by construction;
+        it is expressed at the data term's scale before being added so the
+        public objective ``inertia + lambda * sum w log w`` is evaluated
+        without ever materializing an overflowing inertia.
+        """
+        inertia_scaled, inertia_scale = self._scaled_inertia(
+            scaled_sq, scales, labels
+        )
+        entropy = _entropy(channel_weights.ravel())
+        if inertia_scale == 0.0:
+            return inertia_scaled + regularization * entropy, 0.0
+        entropy_at_scale = regularization * entropy * numpy.float64(
+            2.0 ** (-inertia_scale)
+        )
+        return inertia_scaled + entropy_at_scale, inertia_scale
+
+    @staticmethod
+    def _accept_scaled(new_pair, old_pair, tol_factor=1e-8):
+        """Scale-invariant version of ``new <= old + tol*max(1, |old|)``."""
+        new_scaled, new_scale = new_pair
+        old_scaled, old_scale = old_pair
+        common = max(new_scale, old_scale)
+        old_at_common = old_scaled * numpy.float64(
+            2.0 ** (-(common - old_scale))
+        )
+        new_at_common = new_scaled * numpy.float64(
+            2.0 ** (-(common - new_scale))
+        )
+        if not (numpy.isfinite(old_at_common)
+                and numpy.isfinite(new_at_common)):
+            return new_at_common <= old_at_common
+        tolerance = tol_factor * max(1.0, abs(old_at_common))
+        return new_at_common <= old_at_common + tolerance
+
     def _transform_weighted(self, X, channel_weights):
         """Distance to each cluster center using per-cluster channel weights.
 
@@ -779,13 +913,6 @@ class TimeSeriesKMeans(
         """
         return self._transform_weighted_with_centers(
             X, self.cluster_centers_, channel_weights
-        )
-
-    def _objective_from_dists(self, dists, labels, channel_weights):
-        """True regularized objective J from a distance matrix and labels."""
-        regularization, _ = self._check_adaptive_params()
-        return _compute_inertia(dists, labels, True) + regularization * (
-            _entropy(channel_weights.ravel())
         )
 
     def _fit_one_init_adaptive(self, X, metric_params):
@@ -800,6 +927,12 @@ class TimeSeriesKMeans(
         regularizer. Steps (i)-(iv) never increase the true objective J, so
         the recorded objective history is non-increasing (up to a numerical
         acceptance tolerance of 1e-8 * max(1, |J_previous|)).
+
+        Every squared distance that can overflow is carried in a
+        power-of-two scaled representation, so a state with representable
+        centers, weights and objective is never rejected because an
+        individual alignment cost overflowed; a genuinely
+        non-representable state raises :class:`ValueError`.
         """
         regularization, min_channel_weight = self._check_adaptive_params()
         n_ts = X.shape[0]
@@ -807,11 +940,15 @@ class TimeSeriesKMeans(
         barycenter_size = self.cluster_centers_.shape[1]
         channel_weights = numpy.ones((self.n_clusters, d))
 
-        dists = self._transform_weighted(X, channel_weights)
-        labels = dists.argmin(axis=1)
+        scaled_sq, scales = self._scaled_dists_with_centers(
+            X, self.cluster_centers_, channel_weights
+        )
+        labels = self._assign_scaled(scaled_sq, scales)
         _check_no_empty_cluster(labels, self.n_clusters)
-        objective = self._objective_from_dists(dists, labels, channel_weights)
-        objective_history = [objective]
+        objective_pair = self._objective_scaled(
+            scaled_sq, scales, labels, channel_weights, regularization
+        )
+        objective_history = [_true_or_inf_scaled(*objective_pair)]
 
         for it in range(self.max_iter):
             # (ii) optimal paths for the current centers and weights
@@ -820,11 +957,11 @@ class TimeSeriesKMeans(
                 Xk = X[labels == k]
                 paths_k = []
                 for i in range(Xk.shape[0]):
-                    path, _ = dtw_path(
+                    path, _, _ = _robust_assignment(
                         self.cluster_centers_[k],
                         Xk[i],
-                        channel_weights=channel_weights[k],
-                        **metric_params
+                        dict(metric_params,
+                             channel_weights=channel_weights[k]),
                     )
                     paths_k.append(path)
                 list_paths.append(paths_k)
@@ -850,17 +987,21 @@ class TimeSeriesKMeans(
                 new_channel_weights[k] = _solve_channel_weights_entropy(
                     per_channel, regularization, min_channel_weight
                 )
-            # (i) re-assign with the updated centers and weights
-            new_dists = self._transform_weighted_with_centers(
+                _assert_valid_learned_weights(
+                    new_channel_weights[k], min_channel_weight
+                )
+            # (i) re-assign with the updated centers and weights, keeping
+            # every squared distance in its scaled representation.
+            new_scaled_sq, new_scales = self._scaled_dists_with_centers(
                 X, new_centers, new_channel_weights
             )
-            new_labels = new_dists.argmin(axis=1)
+            new_labels = self._assign_scaled(new_scaled_sq, new_scales)
             _check_no_empty_cluster(new_labels, self.n_clusters)
-            new_objective = self._objective_from_dists(
-                new_dists, new_labels, new_channel_weights
+            new_objective_pair = self._objective_scaled(
+                new_scaled_sq, new_scales, new_labels,
+                new_channel_weights, regularization
             )
-            accept_tol = 1e-8 * max(1.0, abs(objective))
-            if new_objective > objective + accept_tol:
+            if not self._accept_scaled(new_objective_pair, objective_pair):
                 # Should not happen (each step decreases the true objective
                 # in exact arithmetic): refuse the increasing state.
                 warnings.warn(
@@ -872,21 +1013,63 @@ class TimeSeriesKMeans(
                 break
             self.cluster_centers_ = new_centers
             channel_weights = new_channel_weights
-            dists = new_dists
+            scaled_sq, scales = new_scaled_sq, new_scales
             labels = new_labels
+            new_objective = _true_or_inf_scaled(*new_objective_pair)
+            if not numpy.isfinite(new_objective):
+                raise NonRepresentableNumericalState(
+                    "The adaptive k-means objective of an otherwise "
+                    "acceptable state exceeds the float64 range; no finite "
+                    "model can be delivered."
+                )
             objective_history.append(new_objective)
             if self.verbose:
                 print("%.3f" % new_objective, end=" --> ")
-            if abs(objective - new_objective) < self.tol:
-                objective = new_objective
+            if abs(objective_history[-2] - new_objective) < self.tol:
+                objective_pair = new_objective_pair
                 break
-            objective = new_objective
+            objective_pair = new_objective_pair
 
-        self.labels_ = labels
+        # Final delivery contract: the delivered inertia and objective are
+        # the true values corresponding to the returned centers, weights
+        # and a fresh deterministic assignment on the training set.
+        final_scaled_sq, final_scales = self._scaled_dists_with_centers(
+            X, self.cluster_centers_, channel_weights
+        )
+        final_labels = self._assign_scaled(final_scaled_sq, final_scales)
+        _check_no_empty_cluster(final_labels, self.n_clusters)
+        inertia_scaled, inertia_scale = self._scaled_inertia(
+            final_scaled_sq, final_scales, final_labels
+        )
+        inertia = _true_or_inf_scaled(inertia_scaled, inertia_scale)
+        if not numpy.isfinite(inertia):
+            raise NonRepresentableNumericalState(
+                "The final adaptive k-means inertia is not representable "
+                "in float64; refusing to deliver an infinite-inertia model."
+            )
+        if not numpy.all(numpy.isfinite(self.cluster_centers_)):
+            raise NonRepresentableNumericalState(
+                "The learned cluster centers contain non-finite entries."
+            )
+        _assert_valid_learned_weights(
+            channel_weights.reshape(-1), min_channel_weight
+        )
+        final_pair = self._objective_scaled(
+            final_scaled_sq, final_scales, final_labels, channel_weights,
+            regularization
+        )
+        final_objective = _true_or_inf_scaled(*final_pair)
+        if not numpy.isfinite(final_objective):
+            raise NonRepresentableNumericalState(
+                "The final adaptive k-means objective is not representable "
+                "in float64; refusing to deliver an infinite-objective "
+                "model."
+            )
+        self.labels_ = final_labels
         self.channel_weights_ = channel_weights
-        self.inertia_ = _compute_inertia(dists, labels, True)
+        self.inertia_ = inertia
         self.objective_history_ = numpy.array(objective_history)
-        self.objective_ = objective_history[-1]
+        self.objective_ = final_objective
         self._iter = it + 1
         return self
 
@@ -993,6 +1176,29 @@ class TimeSeriesKMeans(
             )
 
     def _assign(self, X, update_class_attributes=True):
+        if self._adaptive_channel_weights and update_class_attributes:
+            # Adaptive mode: keep the assignment and inertia in the scaled
+            # representation so individual squared distances that overflow
+            # float64 do not corrupt a perfectly representable mean
+            # inertia (e.g. two squared costs of 1e308 average to 1e308).
+            scaled_sq, scales = self._scaled_dists_with_centers(
+                X, self.cluster_centers_, self.channel_weights_
+            )
+            matched_labels = self._assign_scaled(scaled_sq, scales)
+            self.labels_ = matched_labels
+            _check_no_empty_cluster(self.labels_, self.n_clusters)
+            inertia_scaled, inertia_scale = self._scaled_inertia(
+                scaled_sq, scales, matched_labels
+            )
+            self.inertia_ = _true_or_inf_scaled(
+                inertia_scaled, inertia_scale
+            )
+            if not numpy.isfinite(self.inertia_):
+                raise NonRepresentableNumericalState(
+                    "The adaptive k-means inertia is not representable in "
+                    "float64 for this assignment."
+                )
+            return matched_labels
         dists = self._transform(X)
         matched_labels = dists.argmin(axis=1)
         if update_class_attributes:
@@ -1097,6 +1303,11 @@ class TimeSeriesKMeans(
         min_objective = numpy.inf
         n_successful = 0
         n_attempts = 0
+        # A non-representable state is a hard failure of an initialization:
+        # it is retried like an empty cluster, but if every attempt ends
+        # that way the original ValueError is re-raised (with the estimator
+        # left unfitted) instead of silently delivering no model.
+        non_representable_error = None
         while n_successful < self.n_init and n_attempts < max_attempts:
             try:
                 if self.verbose and self.n_init > 1:
@@ -1123,6 +1334,27 @@ class TimeSeriesKMeans(
                 # successful descent: it is simply discarded and retried.
                 if self.verbose:
                     print("Resumed because of empty cluster")
+            except NonRepresentableNumericalState as exc:
+                # Every evaluated state of this initialization exceeded the
+                # float64 range. Remember the precise reason and retry with
+                # another initialization; if none succeeds, raise below.
+                non_representable_error = exc
+                if self.verbose:
+                    print("Resumed because of a non-representable state")
+        if (
+            self._adaptive_channel_weights
+            and n_successful == 0
+            and non_representable_error is not None
+        ):
+            # Leave no half-trained attributes behind and fail loudly.
+            self.cluster_centers_ = None
+            self.channel_weights_ = None
+            self.labels_ = None
+            self.inertia_ = None
+            self.objective_ = None
+            self.objective_history_ = None
+            self._X_fit = None
+            raise non_representable_error
         if self._adaptive_channel_weights:
             # Set the learned weights before _post_fit so that the final
             # assignment uses them; the deterministic reassignment performed

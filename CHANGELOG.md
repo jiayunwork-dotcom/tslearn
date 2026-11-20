@@ -12,6 +12,22 @@ Changelogs for this project are recorded in this file since v0.2.0.
 
 ## [Unreleased]
 
+### Fixed
+
+* Overflow-safe weighted DTW and adaptive channel-weight training.
+  Squaring values at the float64 magnitude limit (e.g. `1e308 ** 2`) no
+  longer produces `nan`/`inf` results: zero-weight channels are skipped in
+  the distance kernel, and the DTW dynamic program, per-channel cost
+  accumulation, barycenter MM update, weighted averages and entropy weight
+  solve are evaluated under adaptive power-of-two rescaling whenever an
+  intermediate quantity could overflow. Representable states, including
+  average squared costs such as `1e308`, are now delivered with legal
+  channel weights (`sum = d`, entries >= `min_channel_weight`); genuinely
+  non-representable distances or objectives raise `ValueError` instead of
+  silently returning `nan`, `None` or a half-trained model. Sample weights
+  that share a common finite positive scaling are handled identically, as
+  required by the weighted-mean invariance.
+
 ### Added
 
 * Option `channel_weights` in `dtw`, `dtw_path` and `cdist_dtw` to compute

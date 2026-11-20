@@ -6,6 +6,12 @@ from numba import njit, prange
 from tslearn.backend import instantiate_backend
 from tslearn.utils import to_time_series, to_time_series_dataset
 
+from ._numerics import (
+    NonRepresentableNumericalState,
+    needs_scaled_kernel,
+    scaled_dtw_pair,
+    unscale_value,
+)
 from .utils import _cdist_generic
 
 __author__ = "Romain Tavenard romain.tavenard[at]univ-rennes2.fr"
@@ -86,6 +92,63 @@ def _check_channel_weights(channel_weights, d, be=None):
         raise ValueError("channel_weights must have at least one positive "
                          "entry (an all-zero weight vector is not allowed).")
     return w
+
+
+def _robust_dtw_path_and_score(s1, s2, mask, channel_weights):
+    """Overflow-safe weighted (or unweighted) DTW path and Euclidean score.
+
+    The classic numba kernels are used whenever no intermediate quantity
+    can overflow; otherwise the rescaled kernel from
+    :mod:`tslearn.metrics._numerics` evaluates the same DP recurrence on a
+    power-of-two-scaled cost matrix. The alignment path is identical either
+    way (scaling all cells by a positive common factor preserves arg-min
+    decisions), and the returned distance is the true float64 value when it
+    is representable.
+
+    Raises
+    ------
+    ValueError
+        If the correct distance exceeds the float64 finite range.
+    """
+    if not needs_scaled_kernel(s1, s2, channel_weights):
+        if channel_weights is None:
+            acc_cost_mat = njit_accumulated_matrix(s1, s2, mask=mask)
+        else:
+            acc_cost_mat = njit_accumulated_matrix_weighted(
+                s1, s2, mask=mask, weights=channel_weights
+            )
+        path = _njit_return_path(acc_cost_mat)
+        score = numpy.sqrt(acc_cost_mat[-1, -1])
+        if numpy.isnan(score):
+            raise ValueError(
+                "The DTW distance for this pair of time series is not "
+                "representable as a finite float64 value."
+            )
+        return path, score
+
+    path, scaled_sq, scale_log2, overflowed = scaled_dtw_pair(
+        s1, s2, mask, channel_weights
+    )
+    if overflowed:
+        raise ValueError(
+            "The DTW distance for this pair of time series exceeds the "
+            "float64 finite range and cannot be returned."
+        )
+    # The DP accumulated squared costs divided by scale**2, so undo the
+    # square of the power-of-two scale before taking the square root.
+    sq_cost = unscale_value(scaled_sq, 2.0 * scale_log2)
+    if sq_cost < 0.0:
+        raise ValueError(
+            "The DTW distance for this pair of time series is not "
+            "representable as a finite float64 value."
+        )
+    score = numpy.sqrt(numpy.float64(sq_cost))
+    if not numpy.isfinite(score):
+        raise ValueError(
+            "The DTW distance for this pair of time series is not "
+            "representable as a finite float64 value."
+        )
+    return path, score
 
 
 @njit()
@@ -595,13 +658,7 @@ def dtw_path(
         be=be,
     )
     if be.is_numpy:
-        if channel_weights is None:
-            acc_cost_mat = njit_accumulated_matrix(s1, s2, mask=mask)
-        else:
-            acc_cost_mat = njit_accumulated_matrix_weighted(
-                s1, s2, mask=mask, weights=channel_weights
-            )
-        path = _njit_return_path(acc_cost_mat)
+        return _robust_dtw_path_and_score(s1, s2, mask, channel_weights)
     else:
         acc_cost_mat = accumulated_matrix(s1, s2, mask=mask, be=be)
         path = _return_path(acc_cost_mat, be=be)
@@ -1022,9 +1079,7 @@ def dtw(
         be=be,
     )
     if be.is_numpy:
-        if channel_weights is None:
-            return _njit_dtw(s1, s2, mask=mask)
-        return _njit_dtw_weighted(s1, s2, mask=mask, weights=channel_weights)
+        return _robust_dtw_path_and_score(s1, s2, mask, channel_weights)[1]
     return _dtw(s1, s2, mask=mask, be=be)
 
 

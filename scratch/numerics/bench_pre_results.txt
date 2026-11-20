@@ -1,0 +1,23 @@
+Install h5py to use hdf5 features: http://docs.h5py.org/
+  warn(h5py_msg)
+--- adaptive ---
+  wall time: 30.616 s
+  peak memory: 0.7 MiB
+  dtw_path calls: 2246
+  cdist pair distances: 8656
+  total alignments: 10902
+  n_iter_: 13
+  inertia_: 15.106545
+  objective_: 15.600916
+  channel_weights_:
+[[0. 0. 3.]
+ [0. 3. 0.]
+ [0. 0. 3.]]
+--- standard ---
+  wall time: 14.574 s
+  peak memory: 0.9 MiB
+  dtw_path calls: 5474
+  cdist pair distances: 4318
+  total alignments: 9792
+  n_iter_: 6
+  inertia_: 43.749263

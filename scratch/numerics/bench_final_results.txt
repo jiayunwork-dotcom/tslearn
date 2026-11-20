@@ -1,0 +1,15 @@
+--- adaptive ---
+  wall time: 4.324 s
+  peak memory: 0.6 MiB
+  alignment invocations (dba module): 0
+  alignment invocations (kmeans module): 10166
+  n_iter_: 13
+  inertia_: 15.106545
+  objective_: 15.600916
+--- standard ---
+  wall time: 10.499 s
+  peak memory: 0.9 MiB
+  alignment invocations (dba module): 5451
+  alignment invocations (kmeans module): 19
+  n_iter_: 6
+  inertia_: 43.749263

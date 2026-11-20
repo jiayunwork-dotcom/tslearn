@@ -312,6 +312,54 @@ This is the algorithm at stake when invoking
 ``metric="softdtw"``.
 
 
+Numerical limits and overflow behavior
+--------------------------------------
+
+All DTW-based computations use IEEE-754 float64. When inputs or
+intermediate quantities approach the float64 magnitude limit (around
+``1.8e308``), a naive implementation can turn a finite, representable
+result into ``inf`` or ``nan``: for instance ``1e308 ** 2`` overflows,
+and ``0.0 * inf`` is ``nan``. tslearn handles this as follows.
+
+* **Fixed-weight DTW** (:func:`tslearn.metrics.dtw`,
+  :func:`tslearn.metrics.dtw_path`, :func:`tslearn.metrics.cdist_dtw`
+  with ``channel_weights``): zero-weight channels are skipped explicitly,
+  so they never contribute ``nan`` even when their differences would
+  overflow. Whenever an intermediate square or accumulation could
+  overflow, the dynamic program is re-evaluated on a power-of-two-scaled
+  cost matrix; the scaling is a common positive factor, so the optimal
+  alignment path is unchanged and the true finite distance is returned
+  whenever it fits in float64.
+* If the *correct* distance itself exceeds the float64 finite range, the
+  entry points raise a :class:`ValueError` in finitely many steps instead
+  of returning ``nan`` or ``inf``.
+* **Adaptive training** (``dtw_barycenter_averaging`` and
+  :class:`tslearn.clustering.TimeSeriesKMeans` with
+  ``channel_weight_regularization``) keeps every squared alignment cost,
+  weighted average, barycenter coordinate and entropy solve in scaled
+  representations until the public objective is materialized. A state is
+  therefore delivered as long as its center, channel weights and true
+  objective are finite, even when individual per-series squared distances
+  are not directly representable (for example two squared costs of
+  ``1e308`` whose average is the finite, representable ``1e308``). The
+  learned channel weights always satisfy ``sum_k w_k = d`` and
+  ``w_k >= min_channel_weight``; the last entry of the objective history
+  is the true objective re-evaluated on the returned center and weights.
+* Multiplying every sample weight by the same finite positive constant
+  does not change the barycenter problem: the weighted mean factors
+  cancel, so the result is identical (within floating-point precision) as
+  long as every rescaled weight stays finite.
+* When no evaluated state can be represented in float64, the adaptive
+  estimators raise :class:`ValueError`, leave no half-trained
+  attributes behind, and subsequent calls to ``predict`` raise
+  :class:`~sklearn.exceptions.NotFittedError`; a later fit on well-posed
+  data on the same estimator instance starts from a clean state.
+
+On ordinary-magnitude data the scaled machinery is never entered: the
+classic numba kernels run unchanged, so default (unweighted,
+non-adaptive) results are bit-for-bit the v0.6.4 values.
+
+
 .. minigallery:: tslearn.metrics.dtw tslearn.metrics.dtw_path tslearn.metrics.soft_dtw tslearn.metrics.soft_dtw_alignment tslearn.metrics.dtw_path_from_metric tslearn.metrics.dtw_limited_warping_length tslearn.barycenters.softdtw_barycenter
     :add-heading: Examples Involving DTW variants
     :heading-level: -

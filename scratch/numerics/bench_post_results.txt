@@ -1,0 +1,21 @@
+--- adaptive ---
+  wall time: 4.603 s
+  peak memory: 0.6 MiB
+  dtw_path calls: 0
+  cdist pair distances: 1162
+  total alignments: 1162
+  n_iter_: 13
+  inertia_: 15.106545
+  objective_: 15.600916
+  channel_weights_:
+[[0. 0. 3.]
+ [0. 3. 0.]
+ [0. 0. 3.]]
+--- standard ---
+  wall time: 11.210 s
+  peak memory: 4.7 MiB
+  dtw_path calls: 0
+  cdist pair distances: 4318
+  total alignments: 4318
+  n_iter_: 6
+  inertia_: 43.749263
